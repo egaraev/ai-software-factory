@@ -67,7 +67,11 @@ def _ensure_venv():
 
 
 def _install_requirements():
-    req_file = os.path.join(WORKDIR, "requirements.txt")
+    # prefer requirements-dev.txt when the app splits runtime vs test deps --
+    # the plain requirements.txt alone may not have pytest/httpx in that case
+    req_file = os.path.join(WORKDIR, "requirements-dev.txt")
+    if not os.path.exists(req_file):
+        req_file = os.path.join(WORKDIR, "requirements.txt")
     if os.path.exists(req_file):
         pip_bin = os.path.join(VENV_DIR, "bin", "pip")
         run([pip_bin, "install", "-r", req_file])

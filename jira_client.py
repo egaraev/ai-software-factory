@@ -53,6 +53,27 @@ def append_description(ticket_key, extra_text):
     r.raise_for_status()
 
 
+# moves a ticket to the given status, matched by name against whatever
+# transitions are currently available on it -- transition ids vary per
+# project/workflow, so this looks them up instead of hardcoding one. does
+# nothing and returns False if no matching transition is available right
+# now (e.g. the workflow has no "In Progress" status, or it's already past
+# it), rather than crashing a whole ticket run over a status update
+# sends this to jira:
+#   GET /rest/api/3/issue/KAN-11/transitions
+# returns e.g. {"transitions": [{"id": "21", "name": "In Progress"}, {"id": "31", "name": "Done"}]}
+def transition_to(ticket_key, status_name):
+    url = f"{JIRA_URL}/rest/api/3/issue/{ticket_key}/transitions"
+    r = requests.get(url, auth=(JIRA_EMAIL, JIRA_API_TOKEN))
+    r.raise_for_status()
+    match = next((t for t in r.json()["transitions"] if t["name"].lower() == status_name.lower()), None)
+    if not match:
+        return False
+    r = requests.post(url, auth=(JIRA_EMAIL, JIRA_API_TOKEN), json={"transition": {"id": match["id"]}})
+    r.raise_for_status()
+    return True
+
+
 # posts a comment on a ticket -- used so the ticket itself shows what the
 # developer agent actually did (PR link, or that nothing changed), instead of
 # that only being visible in the pipeline's terminal output or on GitHub
