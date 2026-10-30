@@ -25,7 +25,16 @@ Repeat the block for every file you touch. Do not explain your changes outside t
 async def generate_changes(ticket, repo_files, design_context=None):
     user_prompt = _build_prompt(ticket, repo_files, design_context)
     reply = await _chat(user_prompt)
-    return _parse_file_blocks(reply)
+    changes = _parse_file_blocks(reply)
+    if not changes:
+        # fail loudly here with the model's actual reply, instead of silently
+        # returning nothing and letting a confusing "nothing to commit" git
+        # error surface three layers away from the real cause
+        raise RuntimeError(
+            f"model returned no parseable ===FILE:===/===END=== blocks for {ticket['key']}. "
+            f"Raw reply:\n\n{reply[:4000]}"
+        )
+    return changes
 
 
 def _build_prompt(ticket, repo_files, design_context):
