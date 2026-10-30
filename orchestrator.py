@@ -13,6 +13,7 @@ import jira_client
 NAMESPACE = "pipeline"
 IMAGE = "ghcr.io/egaraev/ai-software-factory:latest"
 SECRET_NAME = "factory-pipeline-env"
+PULL_SECRET_NAME = "ghcr-pull-secret"  # ai-software-factory's GHCR package is private
 
 
 # looks at one epic's tasks in key order and acts on the first one that isn't
@@ -66,7 +67,13 @@ def _job_manifest(key):
         "spec": {
             "backoffLimit": 0,
             "ttlSecondsAfterFinished": 3600,
-            "template": {"spec": {"containers": [container], "restartPolicy": "Never"}},
+            "template": {
+                "spec": {
+                    "containers": [container],
+                    "restartPolicy": "Never",
+                    "imagePullSecrets": [{"name": PULL_SECRET_NAME}],
+                }
+            },
         },
     }
 
