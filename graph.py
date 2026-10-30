@@ -22,6 +22,7 @@ class FactoryState(TypedDict):
     repo_dir: str
     branch: str
     pr_url: str
+    pushed: bool
     test_passed: bool
     test_output: str
 
@@ -40,12 +41,16 @@ async def developer_node(state):
             f.write(content)
 
     passed, output = repo_ops.run_tests()
-    repo_ops.commit_and_push(branch, f"{state['ticket']['key']}: {state['ticket']['summary']}")
+    pushed = repo_ops.commit_and_push(branch, f"{state['ticket']['key']}: {state['ticket']['summary']}")
 
-    return {**state, "repo_dir": repo_dir, "branch": branch, "test_passed": passed, "test_output": output}
+    return {**state, "repo_dir": repo_dir, "branch": branch, "pushed": pushed, "test_passed": passed, "test_output": output}
 
 
 def pr_node(state):
+    # nothing was pushed -- the ticket's outcome was already delivered by a
+    # prior ticket, so there's no branch/diff to open a PR for
+    if not state.get("pushed"):
+        return {**state, "pr_url": None}
     title = f"{state['ticket']['key']}: {state['ticket']['summary']}"
     tail = state["test_output"][-2000:]
     status = "passed" if state["test_passed"] else "FAILED"

@@ -30,11 +30,18 @@ def create_branch(branch_name):
 
 
 # --force-with-lease since create_branch's -B means a retry's local history won't
-# match whatever this ticket's branch already has on the remote from a prior attempt
+# match whatever this ticket's branch already has on the remote from a prior attempt.
+# returns False (and skips commit/push entirely) when there's nothing staged --
+# a legit outcome, not an error: it means an earlier ticket already delivered
+# whatever this one asked for, so the model regenerated identical file content.
 def commit_and_push(branch_name, message):
     run(["git", "add", "-A"], cwd=WORKDIR)
+    nothing_staged = subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=WORKDIR).returncode == 0
+    if nothing_staged:
+        return False
     run(["git", "commit", "-m", message], cwd=WORKDIR)
     run(["git", "push", "-u", "origin", branch_name, "--force-with-lease"], cwd=WORKDIR)
+    return True
 
 
 # installs requirements.txt into the sample app's own venv (creating it if needed)

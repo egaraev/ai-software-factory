@@ -20,6 +20,9 @@ async def run_ticket(ticket_key):
 
     graph = build_graph()
     result = await graph.ainvoke({"ticket": ticket, "design_context": design_context})
+    if not result.get("pr_url"):
+        print(f"no changes needed for {ticket_key} -- already satisfied by prior work, nothing to commit")
+        return
     print(f"PR opened: {result['pr_url']}")
     if not result["test_passed"]:
         print("warning: tests failed locally, review before merging")
