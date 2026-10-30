@@ -1,4 +1,5 @@
 import sys
+import time
 
 from dotenv import load_dotenv
 
@@ -14,7 +15,6 @@ NAMESPACE = "pipeline"
 IMAGE = "ghcr.io/egaraev/ai-software-factory:latest"
 SECRET_NAME = "factory-pipeline-env"
 PULL_SECRET_NAME = "ghcr-pull-secret"  # ai-software-factory's GHCR package is private
-
 
 # looks at one epic's tasks in key order and acts on the first one that isn't
 # Done yet -- To Do spawns its k8s job, In Review checks whether its PR got
@@ -39,19 +39,40 @@ def run_orchestrator(epic_key):
         return  # In Progress (a job's already running) or Needs Info -- leave it
     print(f"{epic_key}: all tasks are Done")
 
-
 def _spawn_job(key):
     config.load_incluster_config()
     batch = client.BatchV1Api()
+    job_name = f"factory-ticket-{key.lower()}"
+    # a ticket moved back to "To Do" (e.g. a manual retry) can outlive its old
+    # job's own ttlSecondsAfterFinished cleanup window (1hr), and k8s refuses to
+    # create a job with a name that's still in use even if that old one already
+    # finished -- delete it first and wait for it to actually disappear
+    _delete_job_if_exists(batch, job_name)
     try:
         batch.create_namespaced_job(namespace=NAMESPACE, body=_job_manifest(key))
         print(f"spawned job for {key}")
     except ApiException as e:
-        if e.status == 409:  # a previous poll already spawned this one
+        if e.status == 409:  # two overlapping polls both tried to spawn this one
             print(f"job for {key} already exists, skipping")
         else:
             raise
 
+def _delete_job_if_exists(batch, job_name):
+    try:
+        batch.delete_namespaced_job(name=job_name, namespace=NAMESPACE, propagation_policy="Background")
+        print(f"deleted stale job {job_name} before respawning")
+    except ApiException as e:
+        if e.status != 404:  # 404 just means there was nothing to clean up
+            raise
+        return
+    for _ in range(10):  # wait up to ~10s for the delete to actually finish
+        try:
+            batch.read_namespaced_job(name=job_name, namespace=NAMESPACE)
+            time.sleep(1)
+        except ApiException as e:
+            if e.status == 404:
+                return
+            raise
 
 def _job_manifest(key):
     container = {
@@ -76,7 +97,6 @@ def _job_manifest(key):
             },
         },
     }
-
 
 if __name__ == "__main__":  # python orchestrator.py KAN-10
     run_orchestrator(sys.argv[1])
