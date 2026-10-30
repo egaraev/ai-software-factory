@@ -7,6 +7,7 @@ import developer_agent
 import github_client
 import jira_client
 import repo_ops
+import reviewer_agent
 
 
 # LangGraph needs a schema to track state between nodes -- this is the one spot
@@ -44,7 +45,7 @@ async def developer_node(state):
     return {**state, "repo_dir": repo_dir, "branch": branch, "pushed": pushed, "test_passed": passed, "test_output": output}
 
 
-def pr_node(state):
+async def pr_node(state):
     key = state["ticket"]["key"]
     # nothing was pushed -- the ticket's outcome was already delivered by a
     # prior ticket, so there's no branch/diff to open a PR for
@@ -63,6 +64,10 @@ def pr_node(state):
     pr_url = github_client.open_pr(state["branch"], title, body)
     jira_client.add_comment(key, f"PR opened: {pr_url}\n\nTests {status} locally.")
     jira_client.transition_to(key, "In Review")
+    try:
+        await reviewer_agent.review_pr(state["ticket"], pr_url)
+    except Exception as e:  # a reviewer outage shouldn't block the PR from existing
+        print(f"warning: reviewer agent failed for {key}: {e}")
     return {**state, "pr_url": pr_url}
 
 

@@ -2,3 +2,4 @@ langgraph
 aiohttp
 requests
 python-dotenv
+kubernetes

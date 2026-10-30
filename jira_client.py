@@ -53,6 +53,20 @@ def append_description(ticket_key, extra_text):
     r.raise_for_status()
 
 
+# lists every task under an epic, in ascending key order -- used by the phase-2
+# orchestrator to walk an epic's tickets in sequence. uses the newer JQL search
+# endpoint, since jira cloud removed the old /rest/api/3/search endpoint
+# sends this to jira:
+#   POST /rest/api/3/search/jql  {"jql": "parent = KAN-17 ORDER BY key ASC", "fields": ["status"]}
+# returns e.g. {"issues": [{"key": "KAN-18", "fields": {"status": {"name": "Done"}}}, ...]}
+def get_epic_tasks(epic_key):
+    url = f"{JIRA_URL}/rest/api/3/search/jql"
+    payload = {"jql": f"parent = {epic_key} ORDER BY key ASC", "fields": ["status"]}
+    r = requests.post(url, auth=(JIRA_EMAIL, JIRA_API_TOKEN), json=payload)
+    r.raise_for_status()
+    return [{"key": issue["key"], "status": issue["fields"]["status"]["name"]} for issue in r.json()["issues"]]
+
+
 # moves a ticket to the given status, matched by name against whatever
 # transitions are currently available on it -- transition ids vary per
 # project/workflow, so this looks them up instead of hardcoding one. does
