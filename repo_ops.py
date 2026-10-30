@@ -10,6 +10,11 @@ WORKDIR = os.environ.get("FACTORY_WORKDIR", "/tmp/factory-sample-app")
 # lives next to WORKDIR, not inside it, so `git add -A` never picks it up
 VENV_DIR = WORKDIR.rstrip("/") + "-venv"
 
+# dirs/extensions to skip when walking the repo for an agent's context
+SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", ".pytest_cache"}
+SKIP_EXTENSIONS = {".pyc", ".png", ".jpg", ".jpeg", ".gif", ".ico", ".db", ".sqlite"}
+MAX_FILE_BYTES = 30000
+
 
 def clone_repo():
     if os.path.exists(WORKDIR):
@@ -70,3 +75,26 @@ def _install_requirements():
 
 def run(cmd, cwd=None):
     subprocess.run(cmd, cwd=cwd, check=True)
+
+
+# walks the whole repo instead of a fixed file list, since the app grows new
+# files/services (backend, frontend, compose) ticket by ticket. used both by
+# the developer agent (to edit the right files) and the architect agent (to
+# design on top of what's already there instead of in a vacuum)
+def read_repo_files(repo_dir):
+    files = {}
+    for root, dirs, filenames in os.walk(repo_dir):
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+        for name in filenames:
+            if os.path.splitext(name)[1] in SKIP_EXTENSIONS:
+                continue
+            full_path = os.path.join(root, name)
+            if os.path.getsize(full_path) > MAX_FILE_BYTES:
+                continue
+            rel_path = os.path.relpath(full_path, repo_dir)
+            try:
+                with open(full_path) as f:
+                    files[rel_path] = f.read()
+            except UnicodeDecodeError:  # skip binary files we didn't catch by extension
+                continue
+    return files

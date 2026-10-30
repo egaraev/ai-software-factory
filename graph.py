@@ -8,12 +8,6 @@ import github_client
 import jira_client
 import repo_ops
 
-# dirs to skip when walking the repo for the model's context
-SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", ".pytest_cache"}
-# binary/lockfile-ish extensions that add tokens without helping the model
-SKIP_EXTENSIONS = {".pyc", ".png", ".jpg", ".jpeg", ".gif", ".ico", ".db", ".sqlite"}
-MAX_FILE_BYTES = 30000
-
 
 # LangGraph needs a schema to track state between nodes -- this is the one spot
 # this project uses type hints, since the framework requires it, not a style choice.
@@ -33,7 +27,7 @@ async def developer_node(state):
     branch = f"ticket-{state['ticket']['key']}"
     repo_ops.create_branch(branch)
 
-    repo_files = _read_repo_files(repo_dir)
+    repo_files = repo_ops.read_repo_files(repo_dir)
     changes = await developer_agent.generate_changes(state["ticket"], repo_files, state.get("design_context"))
     for path, content in changes.items():
         full_path = os.path.join(repo_dir, path)
@@ -61,27 +55,6 @@ def pr_node(state):
     pr_url = github_client.open_pr(state["branch"], title, body)
     jira_client.add_comment(key, f"PR opened: {pr_url}\n\nTests {status} locally.")
     return {**state, "pr_url": pr_url}
-
-
-# walks the whole repo instead of a fixed file list, since the app grows new
-# files/services (backend, frontend, compose) ticket by ticket
-def _read_repo_files(repo_dir):
-    files = {}
-    for root, dirs, filenames in os.walk(repo_dir):
-        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
-        for name in filenames:
-            if os.path.splitext(name)[1] in SKIP_EXTENSIONS:
-                continue
-            full_path = os.path.join(root, name)
-            if os.path.getsize(full_path) > MAX_FILE_BYTES:
-                continue
-            rel_path = os.path.relpath(full_path, repo_dir)
-            try:
-                with open(full_path) as f:
-                    files[rel_path] = f.read()
-            except UnicodeDecodeError:  # skip binary files we didn't catch by extension
-                continue
-    return files
 
 
 def build_graph():

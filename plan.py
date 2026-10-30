@@ -8,14 +8,19 @@ load_dotenv()
 
 import architect_agent
 import jira_client
+import repo_ops
 
 
-# fetches the epic, has the architect agent draft a design + task list, and saves
-# both a human-readable plan-<epic>.md (read this) and a machine-readable
-# plan-<epic>.json (create_tasks.py reads this one, after you've reviewed/edited it)
+# fetches the epic and the current repo (so the architect designs on top of
+# whatever's already built, not in a vacuum), has the architect agent draft a
+# design + task list, and saves both a human-readable plan-<epic>.md (read
+# this) and a machine-readable plan-<epic>.json (create_tasks.py reads this
+# one, after you've reviewed/edited it)
 async def plan_epic(epic_key):
     epic = jira_client.get_ticket(epic_key)
-    design, tasks = await architect_agent.generate_plan(epic)
+    repo_dir = repo_ops.clone_repo()
+    repo_files = repo_ops.read_repo_files(repo_dir)
+    design, tasks = await architect_agent.generate_plan(epic, repo_files)
 
     md_path = f"plan-{epic_key}.md"
     with open(md_path, "w") as f:
