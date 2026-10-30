@@ -34,6 +34,15 @@ def create_branch(branch_name):
     run(["git", "checkout", "-B", branch_name], cwd=WORKDIR)
 
 
+# for a rework pass (see graph.py's developer_node) -- unlike create_branch,
+# which always restarts fresh from main, this picks up the ticket's branch as
+# it was last pushed, so the model sees its own prior attempt (plus whatever
+# feedback) instead of losing it
+def checkout_branch(branch_name):
+    run(["git", "fetch", "origin", branch_name], cwd=WORKDIR)
+    run(["git", "checkout", "-B", branch_name, f"origin/{branch_name}"], cwd=WORKDIR)
+
+
 # --force-with-lease since create_branch's -B means a retry's local history won't
 # match whatever this ticket's branch already has on the remote from a prior attempt.
 # returns False (and skips commit/push entirely) when there's nothing staged --

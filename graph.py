@@ -25,14 +25,27 @@ class FactoryState(TypedDict):
 
 async def developer_node(state):
     key = state["ticket"]["key"]
+    branch = f"ticket-{key}"
+    # an unmerged PR already existing means this run is actually a rework
+    # request -- a human moved the ticket back to "To Do" and left a "REWORK:"
+    # comment asking for a specific change, rather than a fresh ticket (see
+    # jira_client.get_rework_feedback and repo_ops.checkout_branch)
+    existing_pr = github_client.get_pr_for_branch(branch)
+    rework = existing_pr is not None and not existing_pr.get("merged_at")
+    review_feedback = jira_client.get_rework_feedback(key) if rework else None
+
     jira_client.transition_to(key, "In Progress")
 
     repo_dir = repo_ops.clone_repo()
-    branch = f"ticket-{key}"
-    repo_ops.create_branch(branch)
+    if rework:
+        repo_ops.checkout_branch(branch)
+    else:
+        repo_ops.create_branch(branch)
 
     repo_files = repo_ops.read_repo_files(repo_dir)
-    changes = await developer_agent.generate_changes(state["ticket"], repo_files, state.get("design_context"))
+    changes = await developer_agent.generate_changes(
+        state["ticket"], repo_files, state.get("design_context"), review_feedback=review_feedback
+    )
     _write_changes(repo_dir, changes)
 
     passed, output = repo_ops.run_tests()

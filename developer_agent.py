@@ -23,9 +23,12 @@ Repeat the block for every file you touch. Do not explain your changes outside t
 # agent's approved design doc for this project, or None if there isn't one yet.
 # test_feedback is the previous attempt's own pytest output, when this is a
 # retry after that attempt's tests failed (see graph.py's developer_node) --
-# None on a first attempt. returns path -> new content.
-async def generate_changes(ticket, repo_files, design_context=None, test_feedback=None):
-    user_prompt = _build_prompt(ticket, repo_files, design_context, test_feedback)
+# None on a first attempt. review_feedback is a human's "REWORK:" comment on
+# the ticket, when this is a rework pass on an already-open PR instead of a
+# fresh ticket (see jira_client.get_rework_feedback) -- also None otherwise.
+# returns path -> new content.
+async def generate_changes(ticket, repo_files, design_context=None, test_feedback=None, review_feedback=None):
+    user_prompt = _build_prompt(ticket, repo_files, design_context, test_feedback, review_feedback)
     reply = await _chat(user_prompt)
     changes = _parse_file_blocks(reply)
     if not changes:
@@ -56,10 +59,18 @@ REFORMAT_REMINDER = (
 )
 
 
-def _build_prompt(ticket, repo_files, design_context, test_feedback=None):
+def _build_prompt(ticket, repo_files, design_context, test_feedback=None, review_feedback=None):
     files_text = "\n\n".join(f"--- {path} ---\n{content}" for path, content in repo_files.items())
     files_text = files_text or "(repo is empty)"
     design_text = f"Project design notes:\n\n{design_context}\n\n" if design_context else ""
+    # a rework pass -- the current files already reflect the branch's prior PR,
+    # and this is a human asking for a specific change on top of it (not a test
+    # failure, see feedback_text below for that case)
+    review_text = (
+        f"A reviewer left this feedback on your previous attempt at this ticket. The current "
+        f"files below already reflect that attempt -- address the feedback:\n\n"
+        f"{review_feedback}\n\n" if review_feedback else ""
+    )
     # the current files below already reflect the previous (failing) attempt,
     # so this just points the model at the real pytest output and asks it to
     # fix the bug -- same idea as REFORMAT_REMINDER but for a wrong answer
@@ -70,7 +81,7 @@ def _build_prompt(ticket, repo_files, design_context, test_feedback=None):
         f"{test_feedback}\n\n" if test_feedback else ""
     )
     return (
-        f"{design_text}{feedback_text}Ticket {ticket['key']}: {ticket['summary']}\n\n{ticket['description']}\n\n"
+        f"{design_text}{review_text}{feedback_text}Ticket {ticket['key']}: {ticket['summary']}\n\n{ticket['description']}\n\n"
         f"Current files:\n\n{files_text}"
     )
 

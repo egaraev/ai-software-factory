@@ -99,6 +99,30 @@ def add_comment(ticket_key, text):
     r.raise_for_status()
 
 
+# looks for the most recent comment on a ticket that starts with "REWORK:" --
+# that's how a human asks the developer agent to revise an already-open PR
+# instead of starting over (see graph.py's developer_node, and orchestrator.py
+# which spawns a job as soon as the ticket is moved back to "To Do"). returns
+# the feedback text with the prefix stripped, or None if there isn't one
+# sends this to jira:
+#   GET /rest/api/3/issue/KAN-27/comment
+# returns e.g. {"comments": [{"created": "2026-10-30T21:00:00.000+0000",
+#   "body": <ADF doc containing "REWORK: wrap the fixture restore in a try/finally">}]}
+def get_rework_feedback(ticket_key):
+    url = f"{JIRA_URL}/rest/api/3/issue/{ticket_key}/comment"
+    r = requests.get(url, auth=(JIRA_EMAIL, JIRA_API_TOKEN))
+    r.raise_for_status()
+    rework_comments = []
+    for comment in r.json()["comments"]:
+        text = _extract_text(comment["body"]).strip()
+        if text.upper().startswith("REWORK:"):
+            rework_comments.append((comment["created"], text[len("REWORK:"):].strip()))
+    if not rework_comments:
+        return None
+    rework_comments.sort(key=lambda pair: pair[0])
+    return rework_comments[-1][1]  # most recent one, by Jira's own created timestamp
+
+
 # Jira's description field is Atlassian Document Format (nested blocks of text nodes),
 # not plain text -- this walks it and joins every text node it finds.
 def _extract_text(adf):
