@@ -15,13 +15,21 @@ End with one line, exactly "VERDICT: APPROVE" or "VERDICT: CONCERNS", nothing el
 
 # ticket is {"key","summary","description"}. pr_url is the opened PR's html_url.
 # fetches the PR's diff from github, asks fx-verify (a different model family
-# than fx-code/fx-review, kept independent on purpose) to review it, and posts
-# the verdict as a PR comment -- the actual merge decision always stays yours
+# than fx-code/fx-review, kept independent on purpose) to review it. if a second
+# collaborator account's token is configured, posts a real github review (Approve/
+# Request changes) under that account, which is what can actually satisfy a branch
+# protection rule -- otherwise falls back to a plain comment under the main
+# account. either way, merging the PR itself always stays a human decision
 async def review_pr(ticket, pr_url):
     pr_number = _pr_number(pr_url)
     diff = github_client.get_pr_diff(pr_number)
     reply = await _chat(_build_prompt(ticket, diff))
-    github_client.post_pr_comment(pr_number, f"**AI review (fx-verify):**\n\n{reply}")
+    body = f"**AI review (fx-verify):**\n\n{reply}"
+    if github_client.REVIEWER_GITHUB_TOKEN:
+        event = "APPROVE" if "VERDICT: APPROVE" in reply else "REQUEST_CHANGES"
+        github_client.submit_pr_review(pr_number, event, body)
+    else:
+        github_client.post_pr_comment(pr_number, body)
     return reply
 
 

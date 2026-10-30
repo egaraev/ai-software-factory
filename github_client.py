@@ -4,9 +4,17 @@ import requests
 
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "egaraev/factory-sample-app")
+# a second collaborator account's token, used only to submit formal PR reviews --
+# github refuses to let an account approve a PR it also authored, so the reviewer
+# agent needs a different identity than the one that opens PRs (GITHUB_TOKEN above)
+REVIEWER_GITHUB_TOKEN = os.environ.get("REVIEWER_GITHUB_TOKEN")
 
 HEADERS = {
     "Authorization": f"Bearer {GITHUB_TOKEN}",
+    "Accept": "application/vnd.github+json",
+}
+REVIEWER_HEADERS = {
+    "Authorization": f"Bearer {REVIEWER_GITHUB_TOKEN}",
     "Accept": "application/vnd.github+json",
 }
 
@@ -64,6 +72,17 @@ def get_pr_diff(pr_number):
 def post_pr_comment(pr_number, body):
     url = f"https://api.github.com/repos/{GITHUB_REPO}/issues/{pr_number}/comments"
     r = requests.post(url, headers=HEADERS, json={"body": body})
+    r.raise_for_status()
+
+
+# submits a formal review (Approve/Request changes/Comment) using the second
+# collaborator account's token -- this is what actually satisfies a branch
+# protection rule that requires an approving review, unlike post_pr_comment
+# sends this to github:
+#   POST /repos/<repo>/pulls/7/reviews  {"body": "...", "event": "APPROVE"}
+def submit_pr_review(pr_number, event, body):
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/pulls/{pr_number}/reviews"
+    r = requests.post(url, headers=REVIEWER_HEADERS, json={"body": body, "event": event})
     r.raise_for_status()
 
 
