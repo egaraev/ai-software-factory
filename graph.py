@@ -33,16 +33,33 @@ async def developer_node(state):
 
     repo_files = repo_ops.read_repo_files(repo_dir)
     changes = await developer_agent.generate_changes(state["ticket"], repo_files, state.get("design_context"))
+    _write_changes(repo_dir, changes)
+
+    passed, output = repo_ops.run_tests()
+    if not passed:
+        # one retry, same idea as the reformat-retry already in developer_agent.py --
+        # feed the model its own failing pytest output plus the files it just wrote,
+        # and give it one more shot before giving up and pushing whatever we have
+        repo_files = repo_ops.read_repo_files(repo_dir)
+        changes = await developer_agent.generate_changes(
+            state["ticket"], repo_files, state.get("design_context"), test_feedback=output
+        )
+        _write_changes(repo_dir, changes)
+        passed, output = repo_ops.run_tests()
+
+    pushed = repo_ops.commit_and_push(branch, f"{key}: {state['ticket']['summary']}")
+
+    return {**state, "repo_dir": repo_dir, "branch": branch, "pushed": pushed, "test_passed": passed, "test_output": output}
+
+
+# writes a path -> content changeset to disk under repo_dir -- split out of
+# developer_node since the test-failure retry above needs to run it twice
+def _write_changes(repo_dir, changes):
     for path, content in changes.items():
         full_path = os.path.join(repo_dir, path)
         os.makedirs(os.path.dirname(full_path), exist_ok=True)
         with open(full_path, "w") as f:
             f.write(content)
-
-    passed, output = repo_ops.run_tests()
-    pushed = repo_ops.commit_and_push(branch, f"{key}: {state['ticket']['summary']}")
-
-    return {**state, "repo_dir": repo_dir, "branch": branch, "pushed": pushed, "test_passed": passed, "test_output": output}
 
 
 async def pr_node(state):
@@ -65,7 +82,7 @@ async def pr_node(state):
     jira_client.add_comment(key, f"PR opened: {pr_url}\n\nTests {status} locally.")
     jira_client.transition_to(key, "In Review")
     try:
-        await reviewer_agent.review_pr(state["ticket"], pr_url)
+        await reviewer_agent.review_pr(state["ticket"], pr_url, state["test_passed"], tail)
     except Exception as e:  # a reviewer outage shouldn't block the PR from existing
         print(f"warning: reviewer agent failed for {key}: {e}")
     return {**state, "pr_url": pr_url}

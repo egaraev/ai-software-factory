@@ -21,9 +21,11 @@ Repeat the block for every file you touch. Do not explain your changes outside t
 # repo_files is path -> current content for every file the model should see.
 # ticket is {"key", "summary", "description"}. design_context is the architect
 # agent's approved design doc for this project, or None if there isn't one yet.
-# returns path -> new content.
-async def generate_changes(ticket, repo_files, design_context=None):
-    user_prompt = _build_prompt(ticket, repo_files, design_context)
+# test_feedback is the previous attempt's own pytest output, when this is a
+# retry after that attempt's tests failed (see graph.py's developer_node) --
+# None on a first attempt. returns path -> new content.
+async def generate_changes(ticket, repo_files, design_context=None, test_feedback=None):
+    user_prompt = _build_prompt(ticket, repo_files, design_context, test_feedback)
     reply = await _chat(user_prompt)
     changes = _parse_file_blocks(reply)
     if not changes:
@@ -54,12 +56,21 @@ REFORMAT_REMINDER = (
 )
 
 
-def _build_prompt(ticket, repo_files, design_context):
+def _build_prompt(ticket, repo_files, design_context, test_feedback=None):
     files_text = "\n\n".join(f"--- {path} ---\n{content}" for path, content in repo_files.items())
     files_text = files_text or "(repo is empty)"
     design_text = f"Project design notes:\n\n{design_context}\n\n" if design_context else ""
+    # the current files below already reflect the previous (failing) attempt,
+    # so this just points the model at the real pytest output and asks it to
+    # fix the bug -- same idea as REFORMAT_REMINDER but for a wrong answer
+    # instead of a malformed one
+    feedback_text = (
+        f"Your previous attempt at this ticket failed its own tests. The current files below "
+        f"already reflect that attempt -- fix the bug. Here is the actual pytest output:\n\n"
+        f"{test_feedback}\n\n" if test_feedback else ""
+    )
     return (
-        f"{design_text}Ticket {ticket['key']}: {ticket['summary']}\n\n{ticket['description']}\n\n"
+        f"{design_text}{feedback_text}Ticket {ticket['key']}: {ticket['summary']}\n\n{ticket['description']}\n\n"
         f"Current files:\n\n{files_text}"
     )
 
