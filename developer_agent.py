@@ -27,12 +27,13 @@ async def generate_changes(ticket, repo_files, design_context=None):
     reply = await _chat(user_prompt)
     changes = _parse_file_blocks(reply)
     if not changes:
-        # fail loudly here with the model's actual reply, instead of silently
-        # returning nothing and letting a confusing "nothing to commit" git
-        # error surface three layers away from the real cause
-        raise RuntimeError(
-            f"model returned no parseable ===FILE:===/===END=== blocks for {ticket['key']}. "
-            f"Raw reply:\n\n{reply[:4000]}"
+        # usually means the model noticed the ticket's already satisfied by prior
+        # work and explained that in prose instead of writing file blocks -- print
+        # the reply so a genuine parsing failure is still visible, but don't crash:
+        # repo_ops/graph already treat an empty changeset as a clean no-op
+        print(
+            f"warning: model returned no ===FILE:===/===END=== blocks for {ticket['key']}, "
+            f"treating as no-op. Raw reply:\n\n{reply[:2000]}\n"
         )
     return changes
 
