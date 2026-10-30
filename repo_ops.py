@@ -29,10 +29,12 @@ def create_branch(branch_name):
     run(["git", "checkout", "-B", branch_name], cwd=WORKDIR)
 
 
+# --force-with-lease since create_branch's -B means a retry's local history won't
+# match whatever this ticket's branch already has on the remote from a prior attempt
 def commit_and_push(branch_name, message):
     run(["git", "add", "-A"], cwd=WORKDIR)
     run(["git", "commit", "-m", message], cwd=WORKDIR)
-    run(["git", "push", "-u", "origin", branch_name], cwd=WORKDIR)
+    run(["git", "push", "-u", "origin", branch_name, "--force-with-lease"], cwd=WORKDIR)
 
 
 # installs requirements.txt into the sample app's own venv (creating it if needed)

@@ -1,5 +1,4 @@
 import os
-import re
 
 import aiohttp
 
@@ -59,6 +58,21 @@ async def _chat(user_prompt):
             return data["choices"][0]["message"]["content"]
 
 
+# line-by-line instead of regex -- a regex spanning ===FILE:===...===END=== gets
+# confused when a file is meant to be empty (no blank line between the markers,
+# e.g. an __init__.py) and swallows the END marker itself as file content
 def _parse_file_blocks(reply):
-    blocks = re.findall(r"===FILE: (.+?)===\n(.*?)\n===END===", reply, re.DOTALL)
-    return {path.strip(): content for path, content in blocks}
+    files = {}
+    path = None
+    lines = []
+    for line in reply.splitlines():
+        if line.startswith("===FILE: ") and line.endswith("==="):
+            path = line[len("===FILE: "):-len("===")].strip()
+            lines = []
+        elif line.strip() == "===END===":
+            if path:
+                files[path] = "\n".join(lines)
+                path = None
+        elif path is not None:
+            lines.append(line)
+    return files
