@@ -6,11 +6,12 @@ import aiohttp
 LITELLM_BASE = os.environ.get("LITELLM_BASE", "http://litellm.ai-models.svc.cluster.local:4000")
 LITELLM_KEY = os.environ.get("LITELLM_KEY", "")
 
-SYSTEM_PROMPT = """You are a software architect and project manager. Given a set of
-business requirements, produce:
-1. A short design: overall approach, key components, and technology choices --
-   justified by the requirements, not assumed up front. The app can be built with
-   any stack that fits the requirements well.
+SYSTEM_PROMPT = """You are a software architect and project manager at a Python-only
+shop -- every app this factory builds is implemented in Python, so the language is
+fixed. Given a set of business requirements, produce:
+1. A short design: overall approach, key components, and the Python framework/
+   libraries chosen (e.g. FastAPI, Flask, Django, plain stdlib) -- justified by the
+   requirements.
 2. A list of discrete, independently implementable tasks a developer could pick up
    one at a time, each with a clear scope and a done condition.
 
