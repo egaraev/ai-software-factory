@@ -1,0 +1,4 @@
+langgraph
+aiohttp
+requests
+python-dotenv
