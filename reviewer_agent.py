@@ -30,12 +30,19 @@ async def review_pr(ticket, pr_url, tests_passed, test_output):
     pr_number = _pr_number(pr_url)
     diff = github_client.get_pr_diff(pr_number)
     reply = await _chat(_build_prompt(ticket, diff, tests_passed, test_output))
+    # failing tests always block approval no matter what the model's verdict line
+    # says -- a deterministic floor under the model's judgment. fx-verify doesn't
+    # reliably follow the "failing tests = CONCERNS" system prompt instruction on
+    # its own (seen on KAN-25: it approved right under a comment saying tests
+    # FAILED), so rewrite its own verdict line too -- not just the github review
+    # event below -- so a misleading "VERDICT: APPROVE" can never get posted,
+    # whether or not a second reviewer account is configured
+    approved = tests_passed and "VERDICT: APPROVE" in reply
+    if not approved and "VERDICT: APPROVE" in reply:
+        reply = reply.replace("VERDICT: APPROVE", "VERDICT: CONCERNS (overridden -- local tests failed)")
     body = f"**AI review (fx-verify):**\n\n{reply}"
     if github_client.REVIEWER_GITHUB_TOKEN:
-        # failing tests always block approval no matter what the model's verdict
-        # line says -- a deterministic floor under the model's judgment
-        event = "APPROVE" if tests_passed and "VERDICT: APPROVE" in reply else "REQUEST_CHANGES"
-        github_client.submit_pr_review(pr_number, event, body)
+        github_client.submit_pr_review(pr_number, "APPROVE" if approved else "REQUEST_CHANGES", body)
     else:
         github_client.post_pr_comment(pr_number, body)
     return reply
