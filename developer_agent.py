@@ -27,15 +27,31 @@ async def generate_changes(ticket, repo_files, design_context=None):
     reply = await _chat(user_prompt)
     changes = _parse_file_blocks(reply)
     if not changes:
-        # usually means the model noticed the ticket's already satisfied by prior
-        # work and explained that in prose instead of writing file blocks -- print
-        # the reply so a genuine parsing failure is still visible, but don't crash:
-        # repo_ops/graph already treat an empty changeset as a clean no-op
+        # an empty parse isn't always "nothing to do" -- sometimes the model has
+        # real content but explains it in prose/markdown fences instead of the
+        # required format (seen on KAN-22: it wrote the right CI job, just not as
+        # a ===FILE:===/===END=== block). give it one chance to reformat before
+        # falling back to a no-op, so real work doesn't get silently dropped
+        reply = await _chat(user_prompt + REFORMAT_REMINDER)
+        changes = _parse_file_blocks(reply)
+    if not changes:
+        # still nothing after the retry -- now it's most likely a genuine no-op
+        # (ticket already satisfied by prior work). print the reply so a real
+        # parsing failure is still visible, but don't crash: repo_ops/graph
+        # already treat an empty changeset as a clean no-op
         print(
-            f"warning: model returned no ===FILE:===/===END=== blocks for {ticket['key']}, "
-            f"treating as no-op. Raw reply:\n\n{reply[:2000]}\n"
+            f"warning: model returned no ===FILE:===/===END=== blocks for {ticket['key']} "
+            f"even after a reformat retry, treating as no-op. Raw reply:\n\n{reply[:2000]}\n"
         )
     return changes
+
+
+REFORMAT_REMINDER = (
+    "\n\nYour previous reply did not use the required format. Re-send the same "
+    "content, but ONLY as one or more blocks in this exact format, nothing else -- "
+    "no explanations, no markdown code fences:\n\n"
+    "===FILE: path/to/file===\n<full new content of the file>\n===END==="
+)
 
 
 def _build_prompt(ticket, repo_files, design_context):
