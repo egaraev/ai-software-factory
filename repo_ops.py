@@ -22,8 +22,11 @@ def clone_repo():
     return WORKDIR
 
 
+# -B (not -b) resets the branch to start fresh from main if a previous run already
+# created it -- WORKDIR persists between runs, so a retry would otherwise find the
+# branch still sitting there from the attempt that failed partway through
 def create_branch(branch_name):
-    run(["git", "checkout", "-b", branch_name], cwd=WORKDIR)
+    run(["git", "checkout", "-B", branch_name], cwd=WORKDIR)
 
 
 def commit_and_push(branch_name, message):
