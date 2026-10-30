@@ -23,7 +23,10 @@ GITHUB_OWNER = GITHUB_REPO.split("/")[0]
 
 # opens a PR from head branch into base, returns the PR's html_url. if one's
 # already open for this branch -- e.g. retrying a ticket whose earlier PR never
-# got closed -- github refuses a duplicate with 422, so fall back to that PR.
+# got closed -- github refuses a duplicate with 422, so fall back to that PR and
+# refresh its body, since otherwise it's left showing whichever run's test
+# result happened to create it (seen on KAN-25: a PR still said "Tests FAILED"
+# from its first run, even after a later retry actually fixed and passed it)
 # sends this to github:
 #   POST /repos/<repo>/pulls  {"title": "...", "head": "ticket-FACT-12", "base": "main", "body": "..."}
 # returns e.g. {"html_url": "https://github.com/egaraev/factory-sample-app/pull/7", ...}
@@ -34,21 +37,30 @@ def open_pr(head_branch, title, body, base="main"):
     if r.status_code == 422:
         existing = _find_open_pr(head_branch)
         if existing:
-            return existing
+            _update_pr_body(existing["number"], body)
+            return existing["html_url"]
     r.raise_for_status()
     return r.json()["html_url"]
 
 
 # sends this to github:
 #   GET /repos/<repo>/pulls?head=egaraev:ticket-FACT-12&state=open
-# returns e.g. [{"html_url": "https://github.com/egaraev/factory-sample-app/pull/7", ...}]
+# returns e.g. [{"number": 7, "html_url": "https://github.com/egaraev/factory-sample-app/pull/7", ...}]
 def _find_open_pr(head_branch):
     url = f"https://api.github.com/repos/{GITHUB_REPO}/pulls"
     params = {"head": f"{GITHUB_OWNER}:{head_branch}", "state": "open"}
     r = requests.get(url, headers=HEADERS, params=params)
     r.raise_for_status()
     results = r.json()
-    return results[0]["html_url"] if results else None
+    return results[0] if results else None
+
+
+# sends this to github:
+#   PATCH /repos/<repo>/pulls/7  {"body": "..."}
+def _update_pr_body(pr_number, body):
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/pulls/{pr_number}"
+    r = requests.patch(url, headers=HEADERS, json={"body": body})
+    r.raise_for_status()
 
 
 # fetches a PR's diff as raw text instead of the default JSON representation --
