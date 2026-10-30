@@ -9,32 +9,42 @@ LITELLM_KEY = os.environ.get("LITELLM_KEY", "")
 
 SYSTEM_PROMPT = """You are reviewing a pull request before a human decides whether to merge it.
 Check the diff against the ticket's requirements: does it do what was asked, are there obvious
-bugs, missing tests, or anything that looks unsafe. Be concise -- a few sentences, not an essay.
-End with one line, exactly "VERDICT: APPROVE" or "VERDICT: CONCERNS", nothing else on that line."""
+bugs, missing tests, or anything that looks unsafe. You're also given the local test run's
+result -- failing tests always mean CONCERNS, never APPROVE. Be concise -- a few sentences, not
+an essay. End with one line, exactly "VERDICT: APPROVE" or "VERDICT: CONCERNS", nothing else on
+that line."""
 
 
 # ticket is {"key","summary","description"}. pr_url is the opened PR's html_url.
+# tests_passed/test_output are the same local test results already posted to the
+# PR body -- without these the reviewer has no way to know tests failed and can
+# approve a broken PR purely from how the diff looks (seen on KAN-25: it approved
+# a change that failed 18 tests, since it only ever saw the diff before this fix)
 # fetches the PR's diff from github, asks fx-verify (a different model family
 # than fx-code/fx-review, kept independent on purpose) to review it. if a second
 # collaborator account's token is configured, posts a real github review (Approve/
 # Request changes) under that account, which is what can actually satisfy a branch
 # protection rule -- otherwise falls back to a plain comment under the main
 # account. either way, merging the PR itself always stays a human decision
-async def review_pr(ticket, pr_url):
+async def review_pr(ticket, pr_url, tests_passed, test_output):
     pr_number = _pr_number(pr_url)
     diff = github_client.get_pr_diff(pr_number)
-    reply = await _chat(_build_prompt(ticket, diff))
+    reply = await _chat(_build_prompt(ticket, diff, tests_passed, test_output))
     body = f"**AI review (fx-verify):**\n\n{reply}"
     if github_client.REVIEWER_GITHUB_TOKEN:
-        event = "APPROVE" if "VERDICT: APPROVE" in reply else "REQUEST_CHANGES"
+        # failing tests always block approval no matter what the model's verdict
+        # line says -- a deterministic floor under the model's judgment
+        event = "APPROVE" if tests_passed and "VERDICT: APPROVE" in reply else "REQUEST_CHANGES"
         github_client.submit_pr_review(pr_number, event, body)
     else:
         github_client.post_pr_comment(pr_number, body)
     return reply
 
 
-def _build_prompt(ticket, diff):
-    return f"Ticket {ticket['key']}: {ticket['summary']}\n\n{ticket['description']}\n\nDiff:\n\n{diff}"
+def _build_prompt(ticket, diff, tests_passed, test_output):
+    status = "passed" if tests_passed else "FAILED"
+    tests_text = f"Local test run: {status}\n```\n{test_output}\n```\n\n"
+    return f"Ticket {ticket['key']}: {ticket['summary']}\n\n{ticket['description']}\n\n{tests_text}Diff:\n\n{diff}"
 
 
 def _pr_number(pr_url):
