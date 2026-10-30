@@ -23,8 +23,11 @@ class FactoryState(TypedDict):
 
 
 async def developer_node(state):
+    key = state["ticket"]["key"]
+    jira_client.transition_to(key, "In Progress")
+
     repo_dir = repo_ops.clone_repo()
-    branch = f"ticket-{state['ticket']['key']}"
+    branch = f"ticket-{key}"
     repo_ops.create_branch(branch)
 
     repo_files = repo_ops.read_repo_files(repo_dir)
@@ -36,7 +39,7 @@ async def developer_node(state):
             f.write(content)
 
     passed, output = repo_ops.run_tests()
-    pushed = repo_ops.commit_and_push(branch, f"{state['ticket']['key']}: {state['ticket']['summary']}")
+    pushed = repo_ops.commit_and_push(branch, f"{key}: {state['ticket']['summary']}")
 
     return {**state, "repo_dir": repo_dir, "branch": branch, "pushed": pushed, "test_passed": passed, "test_output": output}
 
@@ -46,7 +49,12 @@ def pr_node(state):
     # nothing was pushed -- the ticket's outcome was already delivered by a
     # prior ticket, so there's no branch/diff to open a PR for
     if not state.get("pushed"):
-        jira_client.add_comment(key, "No changes needed -- already satisfied by prior work, nothing to commit.")
+        status = "passed" if state["test_passed"] else "FAILED"
+        jira_client.add_comment(key, f"No changes needed -- already satisfied by prior work, nothing to commit. Tests {status} locally.")
+        # only safe to call it Done when the existing code actually still passes --
+        # otherwise leave the status alone so a human notices something's off
+        if state["test_passed"]:
+            jira_client.transition_to(key, "Done")
         return {**state, "pr_url": None}
     title = f"{key}: {state['ticket']['summary']}"
     tail = state["test_output"][-2000:]
@@ -54,6 +62,7 @@ def pr_node(state):
     body = f"Automated change for {key}.\n\nTests {status} locally:\n```\n{tail}\n```"
     pr_url = github_client.open_pr(state["branch"], title, body)
     jira_client.add_comment(key, f"PR opened: {pr_url}\n\nTests {status} locally.")
+    jira_client.transition_to(key, "In Review")
     return {**state, "pr_url": pr_url}
 
 
