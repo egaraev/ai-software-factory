@@ -53,6 +53,17 @@ def append_description(ticket_key, extra_text):
     r.raise_for_status()
 
 
+# posts a comment on a ticket -- used so the ticket itself shows what the
+# developer agent actually did (PR link, or that nothing changed), instead of
+# that only being visible in the pipeline's terminal output or on GitHub
+# sends this to jira:
+#   POST /rest/api/3/issue/KAN-9/comment  {"body": <ADF doc>}
+def add_comment(ticket_key, text):
+    url = f"{JIRA_URL}/rest/api/3/issue/{ticket_key}/comment"
+    r = requests.post(url, auth=(JIRA_EMAIL, JIRA_API_TOKEN), json={"body": _to_adf(text)})
+    r.raise_for_status()
+
+
 # Jira's description field is Atlassian Document Format (nested blocks of text nodes),
 # not plain text -- this walks it and joins every text node it finds.
 def _extract_text(adf):

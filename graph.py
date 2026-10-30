@@ -5,6 +5,7 @@ from langgraph.graph import END, StateGraph
 
 import developer_agent
 import github_client
+import jira_client
 import repo_ops
 
 # dirs to skip when walking the repo for the model's context
@@ -47,15 +48,18 @@ async def developer_node(state):
 
 
 def pr_node(state):
+    key = state["ticket"]["key"]
     # nothing was pushed -- the ticket's outcome was already delivered by a
     # prior ticket, so there's no branch/diff to open a PR for
     if not state.get("pushed"):
+        jira_client.add_comment(key, "No changes needed -- already satisfied by prior work, nothing to commit.")
         return {**state, "pr_url": None}
-    title = f"{state['ticket']['key']}: {state['ticket']['summary']}"
+    title = f"{key}: {state['ticket']['summary']}"
     tail = state["test_output"][-2000:]
     status = "passed" if state["test_passed"] else "FAILED"
-    body = f"Automated change for {state['ticket']['key']}.\n\nTests {status} locally:\n```\n{tail}\n```"
+    body = f"Automated change for {key}.\n\nTests {status} locally:\n```\n{tail}\n```"
     pr_url = github_client.open_pr(state["branch"], title, body)
+    jira_client.add_comment(key, f"PR opened: {pr_url}\n\nTests {status} locally.")
     return {**state, "pr_url": pr_url}
 
 
