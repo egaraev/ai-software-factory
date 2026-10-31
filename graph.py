@@ -125,7 +125,10 @@ async def pr_node(state):
                 jira_client.transition_to(key, "To Do")
             else:
                 jira_client.add_comment(key, f"Reviewer left CONCERNS after {attempts} automatic rework attempts -- needs a human look.")
-                jira_client.transition_to(key, "Needs Info")
+                # same Human Review column sre_agent.py now uses for this case --
+                # one board-wide meaning for "an agent diagnosed/attempted this,
+                # a human has to judge it" regardless of which pipeline sent it
+                jira_client.transition_to(key, "Human Review")
     return {**state, "pr_url": pr_url}
 
 

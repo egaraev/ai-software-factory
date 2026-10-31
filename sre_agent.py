@@ -128,10 +128,14 @@ async def diagnose_ticket(ticket_key):
             return
         # fix generated but nothing actually differed once written to disk (e.g.
         # a prior run already pushed the identical content) -- fall through to
-        # the normal Needs Info ending, same as having no fix at all
+        # the normal Human Review ending, same as having no fix at all
         jira_client.add_comment(ticket_key, "Proposed fix matched what's already in factory-manifests -- nothing to open a PR for.")
 
-    jira_client.transition_to(ticket_key, "Needs Info")
+    # no fix proposed (or nothing to PR) -- this needs a human to look at the
+    # diagnosis and decide what to do, so it goes to the dedicated Human Review
+    # column rather than Needs Info (which is for "ticket's missing info", a
+    # different situation from "agent diagnosed it, a human has to judge it")
+    jira_client.transition_to(ticket_key, "Human Review")
     print(f"posted diagnosis on {ticket_key}")
 
 
@@ -140,7 +144,7 @@ async def diagnose_ticket(ticket_key):
 # "REWORK: [auto] ..." feedback (same marker the dev pipeline uses, so
 # jira_client.count_auto_rework_attempts counts these too) -- capped so a
 # reviewer that keeps objecting doesn't loop forever; past the cap it falls
-# back to Needs Info for an actual human to look at instead
+# back to Human Review for an actual human to look at instead
 def _handle_review_verdict(ticket_key, approved, review_text):
     if approved:
         return
@@ -150,7 +154,7 @@ def _handle_review_verdict(ticket_key, approved, review_text):
         jira_client.transition_to(ticket_key, "To Do")
     else:
         jira_client.add_comment(ticket_key, f"fx-review left CONCERNS after {attempts} automatic rework attempts -- needs a human look.")
-        jira_client.transition_to(ticket_key, "Needs Info")
+        jira_client.transition_to(ticket_key, "Human Review")
 
 
 # ticket descriptions from alert_webhook.py are plain "Key: value" lines (see
@@ -181,14 +185,20 @@ def _build_prompt(ticket, alert, metrics, events, logs, manifests, review_feedba
         or "(no manifest in factory-manifests mentions this workload -- it may have been deployed by hand and never added to git)"
     )
     review_text = (
-        f"A reviewer (fx-review, a different model from you) left this feedback on your "
-        f"previous fix attempt for this same ticket. The manifests shown below already "
-        f"reflect that attempt -- it is YOUR OWN proposed fix, sitting on an unmerged PR. "
-        f"It is NOT yet on main, NOT yet applied to the cluster, and not evidence the "
-        f"problem is already solved -- the pod is still crash-looping right now with that "
-        f"PR unmerged, which is exactly why you're being asked again. Revise the manifests "
-        f"to address the feedback below, don't start over and don't assume the fix is "
-        f"already live just because you're looking at it:\n\n"
+        f"A reviewer (fx-review, a different model from you) REJECTED your previous fix "
+        f"attempt for this same ticket -- this is not a style note, your diff did not pass. "
+        f"The manifests shown below already reflect that attempt -- it is YOUR OWN proposed "
+        f"fix, sitting on an unmerged PR. It is NOT yet on main, NOT yet applied to the "
+        f"cluster, and not evidence the problem is already solved -- the pod is still "
+        f"crash-looping right now with that PR unmerged, which is exactly why you're being "
+        f"asked again.\n\n"
+        f"Act on every concrete, actionable instruction in the feedback below INSIDE your new "
+        f"file block(s) -- not just acknowledged in your diagnosis prose. Agreeing with a "
+        f"specific suggestion (a flag to add, a resource to drop, a line to revert) in your "
+        f"explanation and then submitting a file block that doesn't actually contain that "
+        f"change is exactly the mistake that got this rejected last time. Only the file block "
+        f"gets reviewed next, not your explanation of it -- if you say you're adding something, "
+        f"it has to actually be in the file:\n\n"
         f"{review_feedback}\n\n" if review_feedback else ""
     )
     return (
