@@ -13,6 +13,7 @@ from kubernetes import client, config
 import github_client
 import jira_client
 import repo_ops
+import reviewer_agent
 
 LITELLM_BASE = os.environ.get("LITELLM_BASE", "http://litellm.ai-models.svc.cluster.local:4000")
 LITELLM_KEY = os.environ.get("LITELLM_KEY", "")
@@ -24,6 +25,12 @@ LOKI_URL = os.environ.get("LOKI_URL", "http://loki.observe.svc.cluster.local:310
 # what's actually deployed, and pushes a fix branch here when it proposes one
 MANIFESTS_REPO = os.environ.get("SRE_MANIFESTS_REPO", "egaraev/factory-manifests")
 MANIFESTS_WORKDIR = os.environ.get("SRE_MANIFESTS_WORKDIR", "/tmp/factory-manifests")
+
+# caps automatic rework retries before a fix PR falls back to a human -- same
+# idea and same number as the dev pipeline's own cap (graph.py's
+# MAX_AUTO_REWORK_ATTEMPTS), just triggered by fx-review's verdict instead of
+# a formal github review
+MAX_AUTO_REWORK_ATTEMPTS = 2
 
 SYSTEM_PROMPT = """You are an SRE diagnosing a Kubernetes alert on a small homelab
 cluster. You're given the alert details, recent metrics, recent pod events, recent
@@ -57,11 +64,26 @@ for a human -- don't force a fix that isn't there."""
 # that workload from factory-manifests, asks fx-verify to diagnose and (when
 # confident) propose a fix, posts the diagnosis as a jira comment. a proposed
 # fix becomes a PR against factory-manifests -- the agent never touches the
-# live cluster itself, a human still merges before ArgoCD applies anything
+# live cluster itself, a human still merges before ArgoCD applies anything.
+#
+# a ticket that's already got an open (unmerged) fix PR is a rework pass, not a
+# fresh run -- either fx-review left CONCERNS and _handle_review_verdict sent it
+# back automatically, or a human did. either way the existing branch is checked
+# out (not reset from main) so the model sees its own prior attempt plus
+# whatever REWORK: feedback is on the ticket, and revises instead of starting over
 async def diagnose_ticket(ticket_key):
     jira_client.transition_to(ticket_key, "In Progress")
     ticket = jira_client.get_ticket(ticket_key)
     alert = _parse_alert(ticket["description"])
+
+    branch = f"sre-{ticket_key.lower()}"
+    existing_pr = github_client.get_pr_for_branch(branch, repo=MANIFESTS_REPO)
+    rework = existing_pr is not None and not existing_pr.get("merged_at")
+    review_feedback = jira_client.get_rework_feedback(ticket_key) if rework else None
+
+    repo_ops.clone_repo(repo=MANIFESTS_REPO, workdir=MANIFESTS_WORKDIR)
+    if rework:
+        repo_ops.checkout_branch(branch, workdir=MANIFESTS_WORKDIR)
 
     if alert["namespace"] and alert["pod"]:
         metrics = _query_metrics(alert["namespace"], alert["pod"])
@@ -72,15 +94,31 @@ async def diagnose_ticket(ticket_key):
         metrics = events = logs = "no namespace/pod on this ticket -- alert didn't carry pod-level labels"
         manifests = {}
 
-    reply = await _chat(_build_prompt(ticket, alert, metrics, events, logs, manifests))
+    reply = await _chat(_build_prompt(ticket, alert, metrics, events, logs, manifests, review_feedback))
     diagnosis, fix = _parse_diagnosis_and_fix(reply)
     jira_client.add_comment(ticket_key, f"**SRE agent diagnosis (fx-verify):**\n\n{diagnosis}")
 
     if fix:
-        pr_url = _open_fix_pr(ticket_key, ticket, fix)
+        pr_url = _open_fix_pr(ticket_key, ticket, fix, branch, rework)
         if pr_url:
             jira_client.add_comment(ticket_key, f"Proposed fix: {pr_url}")
             jira_client.transition_to(ticket_key, "In Review")
+            try:
+                # a second opinion from a different model family (Sonnet, via
+                # fx-review) than the one that wrote the fix (DeepSeek, via
+                # fx-verify) -- posted straight to the PR as a comment, not to
+                # Jira, same as the dev pipeline's reviewer. this NEVER merges,
+                # approves, or requests changes itself -- only _handle_review_verdict
+                # below reacts to the verdict, and even that only ever sends the
+                # ticket back for another attempt or to a human, never merges.
+                # a reviewer outage shouldn't block the PR from existing, same as
+                # graph.py's own try/except around the dev pipeline's reviewer call
+                approved, review_text = await reviewer_agent.review_fix_pr(
+                    ticket_key, ticket["summary"], diagnosis, pr_url, repo=MANIFESTS_REPO
+                )
+                _handle_review_verdict(ticket_key, approved, review_text)
+            except Exception as e:
+                print(f"warning: reviewer agent failed for {ticket_key}: {e}")
             print(f"posted diagnosis + fix PR on {ticket_key}")
             return
         # fix generated but nothing actually differed once written to disk (e.g.
@@ -90,6 +128,24 @@ async def diagnose_ticket(ticket_key):
 
     jira_client.transition_to(ticket_key, "Needs Info")
     print(f"posted diagnosis on {ticket_key}")
+
+
+# APPROVE just leaves the ticket at In Review for a human to merge -- nothing
+# to do here. CONCERNS sends it back to To Do with fx-review's own text as
+# "REWORK: [auto] ..." feedback (same marker the dev pipeline uses, so
+# jira_client.count_auto_rework_attempts counts these too) -- capped so a
+# reviewer that keeps objecting doesn't loop forever; past the cap it falls
+# back to Needs Info for an actual human to look at instead
+def _handle_review_verdict(ticket_key, approved, review_text):
+    if approved:
+        return
+    attempts = jira_client.count_auto_rework_attempts(ticket_key)
+    if attempts < MAX_AUTO_REWORK_ATTEMPTS:
+        jira_client.add_comment(ticket_key, f"REWORK: [auto] {review_text}")
+        jira_client.transition_to(ticket_key, "To Do")
+    else:
+        jira_client.add_comment(ticket_key, f"fx-review left CONCERNS after {attempts} automatic rework attempts -- needs a human look.")
+        jira_client.transition_to(ticket_key, "Needs Info")
 
 
 # ticket descriptions from alert_webhook.py are plain "Key: value" lines (see
@@ -109,13 +165,24 @@ def _parse_alert(description):
     }
 
 
-def _build_prompt(ticket, alert, metrics, events, logs, manifests):
+# review_feedback is fx-review's critique of this ticket's previous fix attempt,
+# when this is a rework pass (see diagnose_ticket) -- None on a first attempt.
+# when it's set, the manifests above already reflect that previous attempt
+# (diagnose_ticket checked out the existing branch before gathering them), so
+# this just points the model at the feedback and asks it to revise, not restart
+def _build_prompt(ticket, alert, metrics, events, logs, manifests, review_feedback=None):
     manifests_text = (
         "\n\n".join(f"--- {path} ---\n{content}" for path, content in manifests.items())
         or "(no manifest in factory-manifests mentions this workload -- it may have been deployed by hand and never added to git)"
     )
+    review_text = (
+        f"A reviewer (fx-review, a different model from you) left this feedback on your "
+        f"previous fix attempt for this same ticket. The manifests shown below already "
+        f"reflect that attempt -- revise them to address the feedback, don't start over:\n\n"
+        f"{review_feedback}\n\n" if review_feedback else ""
+    )
     return (
-        f"Ticket {ticket['key']}: {ticket['summary']}\n\n"
+        f"{review_text}Ticket {ticket['key']}: {ticket['summary']}\n\n"
         f"Alert: {alert['alertname']} (severity: {alert['severity']})\n"
         f"Alert summary: {alert['summary']}\n\n"
         f"Recent metrics:\n{metrics}\n\n"
@@ -178,16 +245,19 @@ def _recent_events(namespace, pod):
     return "\n".join(f"{e.last_timestamp} {e.reason}: {e.message}" for e in matching[-20:]) or "no recent events"
 
 
-# clones/pulls factory-manifests and returns path -> content for every file that
-# mentions this workload by name -- a plain substring grep, but it's what lets
-# the model ground its diagnosis and fix in the actual deployed config instead
-# of guessing from general knowledge of the image. empty if nothing in the repo
-# mentions it (deployed by hand and never added to git -- the diagnosis prompt
-# tells the model to say so rather than invent a fix in that case)
+# returns path -> content for every file in the currently checked-out
+# factory-manifests working copy that mentions this workload by name -- a plain
+# substring grep, but it's what lets the model ground its diagnosis and fix in
+# actual config instead of guessing from general knowledge of the image. the
+# caller (diagnose_ticket) has already cloned the repo and checked out the
+# right ref -- main for a fresh diagnosis, this ticket's own branch for a
+# rework pass -- so this sees either the deployed original or the agent's own
+# prior attempt, whichever applies. empty if nothing in the repo mentions the
+# workload (deployed by hand, never added to git -- the diagnosis prompt tells
+# the model to say so rather than invent a fix in that case)
 def _relevant_manifests(pod):
     if not pod:
         return {}
-    repo_ops.clone_repo(repo=MANIFESTS_REPO, workdir=MANIFESTS_WORKDIR)
     all_files = repo_ops.read_repo_files(MANIFESTS_WORKDIR)
     return {path: content for path, content in all_files.items() if pod in content}
 
@@ -218,13 +288,14 @@ def _parse_diagnosis_and_fix(reply):
     return "\n".join(diagnosis_lines).strip(), changes
 
 
-# writes a proposed fix to a branch on factory-manifests and opens a PR for it.
+# writes a proposed fix to a branch on factory-manifests and opens a PR for it
+# (or updates the existing one, on a rework pass -- see diagnose_ticket, which
+# has already cloned the repo and, for rework, checked out this branch).
 # returns the PR url, or None if there was nothing to actually commit (the
 # model's proposed content turned out identical to what's already there)
-def _open_fix_pr(ticket_key, ticket, fix):
-    branch = f"sre-{ticket_key.lower()}"
-    repo_ops.clone_repo(repo=MANIFESTS_REPO, workdir=MANIFESTS_WORKDIR)
-    repo_ops.create_branch(branch, workdir=MANIFESTS_WORKDIR)
+def _open_fix_pr(ticket_key, ticket, fix, branch, rework):
+    if not rework:
+        repo_ops.create_branch(branch, workdir=MANIFESTS_WORKDIR)
     for path, content in fix.items():
         full_path = os.path.join(MANIFESTS_WORKDIR, path)
         os.makedirs(os.path.dirname(full_path), exist_ok=True)
