@@ -75,6 +75,12 @@ def _write_changes(repo_dir, changes):
             f.write(content)
 
 
+# caps automatic rework retries before a ticket falls back to a human --
+# a human's own plain "REWORK:" comment is never capped, only ones the
+# pipeline posts itself with the "[auto]" marker (see jira_client.count_auto_rework_attempts)
+MAX_AUTO_REWORK_ATTEMPTS = 2
+
+
 async def pr_node(state):
     key = state["ticket"]["key"]
     # nothing was pushed -- the ticket's outcome was already delivered by a
@@ -94,10 +100,32 @@ async def pr_node(state):
     pr_url = github_client.open_pr(state["branch"], title, body)
     jira_client.add_comment(key, f"PR opened: {pr_url}\n\nTests {status} locally.")
     jira_client.transition_to(key, "In Review")
+    approved, review_text = None, None
     try:
-        await reviewer_agent.review_pr(state["ticket"], pr_url, state["test_passed"], tail)
+        approved, review_text = await reviewer_agent.review_pr(state["ticket"], pr_url, state["test_passed"], tail)
     except Exception as e:  # a reviewer outage shouldn't block the PR from existing
         print(f"warning: reviewer agent failed for {key}: {e}")
+    # auto-merge/auto-rework only kicks in once a real second reviewer account is
+    # configured (REVIEWER_GITHUB_TOKEN) -- without it there's no formal github
+    # review satisfying the branch protection rule, so the PR just waits for a
+    # human either way, same as before this feature existed
+    if github_client.REVIEWER_GITHUB_TOKEN and approved is not None:
+        if approved:
+            github_client.merge_pr(github_client.pr_number_from_url(pr_url))
+            jira_client.add_comment(key, "Reviewer approved and tests passed -- auto-merged.")
+            jira_client.transition_to(key, "Done")
+        else:
+            attempts = jira_client.count_auto_rework_attempts(key)
+            if attempts < MAX_AUTO_REWORK_ATTEMPTS:
+                # moving it back to "To Do" is exactly what a human does to
+                # trigger a manual rework -- the orchestrator's existing "To Do"
+                # handling (and developer_node's existing-PR check) picks this
+                # up automatically on its next poll, no new code needed there
+                jira_client.add_comment(key, f"REWORK: [auto] {review_text}")
+                jira_client.transition_to(key, "To Do")
+            else:
+                jira_client.add_comment(key, f"Reviewer left CONCERNS after {attempts} automatic rework attempts -- needs a human look.")
+                jira_client.transition_to(key, "Needs Info")
     return {**state, "pr_url": pr_url}
 
 

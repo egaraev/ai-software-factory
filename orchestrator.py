@@ -1,4 +1,3 @@
-import sys
 import time
 
 from dotenv import load_dotenv
@@ -16,13 +15,29 @@ IMAGE = "ghcr.io/egaraev/ai-software-factory:latest"
 SECRET_NAME = "factory-pipeline-env"
 PULL_SECRET_NAME = "ghcr-pull-secret"  # ai-software-factory's GHCR package is private
 
+# walks every epic in the project (see jira_client.get_epics) instead of one
+# hardcoded epic key -- this is what makes "just create an epic in Jira" the
+# whole workflow, no more editing cronjob.yaml per epic
+def run_orchestrator():
+    epics = jira_client.get_epics()
+    if not epics:
+        print("no epics found")
+        return
+    for epic in epics:
+        _process_epic(epic["key"])
+
 # looks at one epic's tasks in key order and acts on the first one that isn't
 # Done yet -- To Do spawns its k8s job, In Review checks whether its PR got
 # merged (and closes the ticket if so, then checks the next one too), anything
-# else (In Progress/Needs Info) just waits. meant to be polled on a cron, so
-# each run only needs to move the epic forward by whatever's ready right now
-def run_orchestrator(epic_key):
-    for task in jira_client.get_epic_tasks(epic_key):
+# else (In Progress/Needs Info) just waits. an epic with no tasks yet (brand
+# new, just created in Jira) gets a planning job instead, which is what turns
+# its title/description into real tasks the loop below can then walk
+def _process_epic(epic_key):
+    tasks = jira_client.get_epic_tasks(epic_key)
+    if not tasks:
+        _spawn_planning_job(epic_key)
+        return
+    for task in tasks:
         key, status = task["key"], task["status"]
         if status == "Done":
             continue
@@ -35,7 +50,7 @@ def run_orchestrator(epic_key):
                 jira_client.add_comment(key, "PR merged -- closing ticket.")
                 jira_client.transition_to(key, "Done")
                 continue
-            return  # still waiting on the merge
+            return  # still waiting on the merge (manual, or auto-merge not configured)
         if status == "In Progress" and _job_crashed_or_missing(key):
             jira_client.add_comment(key, "Its job crashed or disappeared while In Progress -- resetting to To Do for a retry.")
             jira_client.transition_to(key, "To Do")
@@ -62,21 +77,57 @@ def _job_crashed_or_missing(key):
         raise
     return bool(job.status.failed)
 
+# both ticket jobs and planning jobs share the same GPU (llama-swap pins it to
+# one process at a time, see k3s-switch's own comments on this), so only one
+# of either kind is ever allowed to run at once across every open epic
+def _any_active_pipeline_job():
+    config.load_incluster_config()
+    batch = client.BatchV1Api()
+    jobs = batch.list_namespaced_job(namespace=NAMESPACE).items
+    return any(
+        job.metadata.name.startswith(("factory-ticket-", "factory-epic-"))
+        and (job.status.active or 0) > 0
+        for job in jobs
+    )
+
 def _spawn_job(key):
+    if _any_active_pipeline_job():
+        print(f"a pipeline job is already running -- not starting {key} yet (shared GPU)")
+        return
     config.load_incluster_config()
     batch = client.BatchV1Api()
     job_name = f"factory-ticket-{key.lower()}"
-    # a ticket moved back to "To Do" (e.g. a manual retry) can outlive its old
-    # job's own ttlSecondsAfterFinished cleanup window (1hr), and k8s refuses to
-    # create a job with a name that's still in use even if that old one already
+    # a ticket moved back to "To Do" (e.g. a manual or auto retry) can outlive its
+    # old job's own ttlSecondsAfterFinished cleanup window (1hr), and k8s refuses
+    # to create a job with a name that's still in use even if that old one already
     # finished -- delete it first and wait for it to actually disappear
     _delete_job_if_exists(batch, job_name)
     try:
-        batch.create_namespaced_job(namespace=NAMESPACE, body=_job_manifest(key))
+        batch.create_namespaced_job(namespace=NAMESPACE, body=_job_manifest(job_name, ["python", "main.py", key]))
         print(f"spawned job for {key}")
     except ApiException as e:
         if e.status == 409:  # two overlapping polls both tried to spawn this one
             print(f"job for {key} already exists, skipping")
+        else:
+            raise
+
+# turns a brand-new epic's title/description into real tasks by running the
+# architect agent (plan_and_create_tasks.py) as its own k8s job -- same
+# shared-GPU guard as a ticket job, so planning never fights a ticket run
+def _spawn_planning_job(epic_key):
+    if _any_active_pipeline_job():
+        print(f"a pipeline job is already running -- not planning {epic_key} yet (shared GPU)")
+        return
+    config.load_incluster_config()
+    batch = client.BatchV1Api()
+    job_name = f"factory-epic-{epic_key.lower()}"
+    _delete_job_if_exists(batch, job_name)
+    try:
+        batch.create_namespaced_job(namespace=NAMESPACE, body=_job_manifest(job_name, ["python", "plan_and_create_tasks.py", epic_key]))
+        print(f"spawned planning job for {epic_key}")
+    except ApiException as e:
+        if e.status == 409:
+            print(f"planning job for {epic_key} already exists, skipping")
         else:
             raise
 
@@ -97,17 +148,20 @@ def _delete_job_if_exists(batch, job_name):
                 return
             raise
 
-def _job_manifest(key):
+# shared by both job types -- name is the k8s job name, command is the
+# container's entrypoint (["python", "main.py", key] for a ticket job,
+# ["python", "plan_and_create_tasks.py", epic_key] for a planning job)
+def _job_manifest(name, command):
     container = {
         "name": "pipeline",
         "image": IMAGE,
-        "command": ["python", "main.py", key],
+        "command": command,
         "envFrom": [{"secretRef": {"name": SECRET_NAME}}],
     }
     return {
         "apiVersion": "batch/v1",
         "kind": "Job",
-        "metadata": {"name": f"factory-ticket-{key.lower()}"},
+        "metadata": {"name": name},
         "spec": {
             "backoffLimit": 0,
             "ttlSecondsAfterFinished": 3600,
@@ -121,5 +175,5 @@ def _job_manifest(key):
         },
     }
 
-if __name__ == "__main__":  # python orchestrator.py KAN-10
-    run_orchestrator(sys.argv[1])
+if __name__ == "__main__":  # python orchestrator.py -- walks every open epic, one step each
+    run_orchestrator()

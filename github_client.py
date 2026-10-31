@@ -111,3 +111,20 @@ def get_pr_for_branch(head_branch, state="all"):
     r.raise_for_status()
     results = r.json()
     return results[0] if results else None
+
+
+# a PR's html_url always ends in its number (".../pull/7") -- pulled out here
+# so graph.py and reviewer_agent.py don't each need their own copy
+def pr_number_from_url(pr_url):
+    return int(pr_url.rstrip("/").rsplit("/", 1)[-1])
+
+
+# merges a PR -- used for auto-merge once the formal reviewer account approves
+# and local tests passed (see graph.py's pr_node)
+# sends this to github:
+#   PUT /repos/<repo>/pulls/7/merge  {"merge_method": "merge"}
+# returns e.g. {"merged": true, "sha": "...", "message": "Pull Request successfully merged"}
+def merge_pr(pr_number, merge_method="merge"):
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/pulls/{pr_number}/merge"
+    r = requests.put(url, headers=HEADERS, json={"merge_method": merge_method})
+    r.raise_for_status()

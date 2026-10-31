@@ -25,9 +25,10 @@ that line."""
 # collaborator account's token is configured, posts a real github review (Approve/
 # Request changes) under that account, which is what can actually satisfy a branch
 # protection rule -- otherwise falls back to a plain comment under the main
-# account. either way, merging the PR itself always stays a human decision
+# account. returns (approved, reply) -- graph.py uses approved to decide
+# whether to auto-merge or auto-rework the PR
 async def review_pr(ticket, pr_url, tests_passed, test_output):
-    pr_number = _pr_number(pr_url)
+    pr_number = github_client.pr_number_from_url(pr_url)
     diff = github_client.get_pr_diff(pr_number)
     reply = await _chat(_build_prompt(ticket, diff, tests_passed, test_output))
     # failing tests always block approval no matter what the model's verdict line
@@ -45,17 +46,13 @@ async def review_pr(ticket, pr_url, tests_passed, test_output):
         github_client.submit_pr_review(pr_number, "APPROVE" if approved else "REQUEST_CHANGES", body)
     else:
         github_client.post_pr_comment(pr_number, body)
-    return reply
+    return approved, reply
 
 
 def _build_prompt(ticket, diff, tests_passed, test_output):
     status = "passed" if tests_passed else "FAILED"
     tests_text = f"Local test run: {status}\n```\n{test_output}\n```\n\n"
     return f"Ticket {ticket['key']}: {ticket['summary']}\n\n{ticket['description']}\n\n{tests_text}Diff:\n\n{diff}"
-
-
-def _pr_number(pr_url):
-    return int(pr_url.rstrip("/").rsplit("/", 1)[-1])
 
 
 # sends this to litellm's /v1/chat/completions:

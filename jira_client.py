@@ -5,6 +5,7 @@ import requests
 JIRA_URL = os.environ.get("JIRA_URL")
 JIRA_EMAIL = os.environ.get("JIRA_EMAIL")
 JIRA_API_TOKEN = os.environ.get("JIRA_API_TOKEN")
+PROJECT_KEY = os.environ.get("JIRA_PROJECT_KEY", "KAN")
 
 
 # ticket_key is like "KAN-12", returns {"key", "summary", "description", "parent_key"}.
@@ -67,6 +68,22 @@ def get_epic_tasks(epic_key):
     return [{"key": issue["key"], "status": issue["fields"]["status"]["name"]} for issue in r.json()["issues"]]
 
 
+# lists every epic in the project, in ascending key order -- lets the
+# orchestrator auto-discover epics instead of needing one hardcoded epic key
+# in cronjob.yaml. doesn't filter by the epic issue's own status field (that
+# varies by workflow and isn't reliable) -- whether an epic still has work is
+# decided by whether all its child tasks are Done (see orchestrator.py)
+# sends this to jira:
+#   POST /rest/api/3/search/jql  {"jql": "project = KAN AND issuetype = Epic ORDER BY key ASC"}
+# returns e.g. {"issues": [{"key": "KAN-24"}, {"key": "KAN-31"}]}
+def get_epics():
+    url = f"{JIRA_URL}/rest/api/3/search/jql"
+    payload = {"jql": f"project = {PROJECT_KEY} AND issuetype = Epic ORDER BY key ASC", "fields": ["status"]}
+    r = requests.post(url, auth=(JIRA_EMAIL, JIRA_API_TOKEN), json=payload)
+    r.raise_for_status()
+    return [{"key": issue["key"]} for issue in r.json()["issues"]]
+
+
 # moves a ticket to the given status, matched by name against whatever
 # transitions are currently available on it -- transition ids vary per
 # project/workflow, so this looks them up instead of hardcoding one. does
@@ -121,6 +138,21 @@ def get_rework_feedback(ticket_key):
         return None
     rework_comments.sort(key=lambda pair: pair[0])
     return rework_comments[-1][1]  # most recent one, by Jira's own created timestamp
+
+
+# counts how many automatic rework attempts a ticket has already had -- used to
+# cap auto-retry-on-CONCERNS (see graph.py's pr_node) before falling back to a
+# human. only counts comments the pipeline itself posted ("REWORK: [auto] ..."),
+# not a human's plain "REWORK: ..." comment, so a human asking for rework is
+# never blocked by the automatic cap
+# sends this to jira:
+#   GET /rest/api/3/issue/KAN-27/comment
+# returns e.g. {"comments": [{"body": <ADF doc containing "REWORK: [auto] ...">}]}
+def count_auto_rework_attempts(ticket_key):
+    url = f"{JIRA_URL}/rest/api/3/issue/{ticket_key}/comment"
+    r = requests.get(url, auth=(JIRA_EMAIL, JIRA_API_TOKEN))
+    r.raise_for_status()
+    return sum(1 for c in r.json()["comments"] if _extract_text(c["body"]).strip().upper().startswith("REWORK: [AUTO"))
 
 
 # Jira's description field is Atlassian Document Format (nested blocks of text nodes),
