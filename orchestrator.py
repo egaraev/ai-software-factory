@@ -36,8 +36,31 @@ def run_orchestrator(epic_key):
                 jira_client.transition_to(key, "Done")
                 continue
             return  # still waiting on the merge
-        return  # In Progress (a job's already running) or Needs Info -- leave it
+        if status == "In Progress" and _job_crashed_or_missing(key):
+            jira_client.add_comment(key, "Its job crashed or disappeared while In Progress -- resetting to To Do for a retry.")
+            jira_client.transition_to(key, "To Do")
+            return
+        return  # In Progress (a job's genuinely still running) or Needs Info -- leave it
     print(f"{epic_key}: all tasks are Done")
+
+# an "In Progress" ticket with no live job behind it is stuck -- its job either
+# crashed (backoffLimit:0 means one failure is final) or got cleaned up/never
+# spawned at all, and nothing will ever move it forward on its own. resetting
+# it to "To Do" routes it back through the normal To Do handling above, which
+# already picks the right branch (fresh vs. rework) via graph.py's own check
+# for an existing PR -- this only covers a job actually crashing or vanishing,
+# not a ticket whose job succeeded but whose own Jira status update failed
+def _job_crashed_or_missing(key):
+    config.load_incluster_config()
+    batch = client.BatchV1Api()
+    job_name = f"factory-ticket-{key.lower()}"
+    try:
+        job = batch.read_namespaced_job(name=job_name, namespace=NAMESPACE)
+    except ApiException as e:
+        if e.status == 404:
+            return True  # never spawned, or already cleaned up -- stuck either way
+        raise
+    return bool(job.status.failed)
 
 def _spawn_job(key):
     config.load_incluster_config()
