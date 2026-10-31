@@ -68,20 +68,23 @@ def get_epic_tasks(epic_key):
     return [{"key": issue["key"], "status": issue["fields"]["status"]["name"]} for issue in r.json()["issues"]]
 
 
-# lists every epic in the project, in ascending key order -- lets the
-# orchestrator auto-discover epics instead of needing one hardcoded epic key
-# in cronjob.yaml. doesn't filter by the epic issue's own status field (that
-# varies by workflow and isn't reliable) -- whether an epic still has work is
-# decided by whether all its child tasks are Done (see orchestrator.py)
+# lists every epic in the project that isn't Done yet, in ascending key order --
+# lets the orchestrator auto-discover epics instead of needing one hardcoded
+# epic key in cronjob.yaml. skips Done epics explicitly -- an epic with zero
+# linked tasks (e.g. an old one from before this auto-planning existed, or a
+# closed one someone never broke into Jira tasks) would otherwise look
+# "unplanned" forever and get replanned on every single poll (seen in practice:
+# a leftover "Hello World API" epic kept spawning fresh batches of tasks until
+# it got excluded here -- moving an epic to Done is now what actually stops it)
 # sends this to jira:
 #   POST /rest/api/3/search/jql  {"jql": "project = KAN AND issuetype = Epic ORDER BY key ASC"}
-# returns e.g. {"issues": [{"key": "KAN-24"}, {"key": "KAN-31"}]}
+# returns e.g. {"issues": [{"key": "KAN-24", "fields": {"status": {"name": "Done"}}}, ...]}
 def get_epics():
     url = f"{JIRA_URL}/rest/api/3/search/jql"
     payload = {"jql": f"project = {PROJECT_KEY} AND issuetype = Epic ORDER BY key ASC", "fields": ["status"]}
     r = requests.post(url, auth=(JIRA_EMAIL, JIRA_API_TOKEN), json=payload)
     r.raise_for_status()
-    return [{"key": issue["key"]} for issue in r.json()["issues"]]
+    return [{"key": issue["key"]} for issue in r.json()["issues"] if issue["fields"]["status"]["name"].lower() != "done"]
 
 
 # moves a ticket to the given status, matched by name against whatever
