@@ -54,6 +54,17 @@ def append_description(ticket_key, extra_text):
     r.raise_for_status()
 
 
+# adds one label to a ticket without touching any labels already on it -- used by
+# alert_webhook.py to mark an auto-created ticket "ops" so orchestrator.py's
+# get_ops_tickets() picks it up
+# sends this to jira:
+#   PUT /rest/api/3/issue/KAN-91  {"update": {"labels": [{"add": "ops"}]}}
+def add_label(ticket_key, label):
+    url = f"{JIRA_URL}/rest/api/3/issue/{ticket_key}"
+    r = requests.put(url, auth=(JIRA_EMAIL, JIRA_API_TOKEN), json={"update": {"labels": [{"add": label}]}})
+    r.raise_for_status()
+
+
 # lists every task under an epic, in ascending key order -- used by the phase-2
 # orchestrator to walk an epic's tickets in sequence. uses the newer JQL search
 # endpoint, since jira cloud removed the old /rest/api/3/search endpoint.
@@ -96,6 +107,39 @@ def get_epics():
         for issue in r.json()["issues"]
         if issue["fields"]["status"]["name"].lower() != "done"
     ]
+
+
+# lists every "ops" labeled ticket that isn't Done yet -- these live outside any
+# epic (alert_webhook.py creates them standalone), so they need their own poll
+# loop in orchestrator.py instead of being walked via an epic's tasks
+# sends this to jira:
+#   POST /rest/api/3/search/jql  {"jql": "project = KAN AND labels = ops ORDER BY key ASC", "fields": ["status", "assignee"]}
+# returns e.g. {"issues": [{"key": "KAN-91", "fields": {"status": {"name": "To Do"}, "assignee": None}}, ...]}
+def get_ops_tickets():
+    url = f"{JIRA_URL}/rest/api/3/search/jql"
+    payload = {"jql": f"project = {PROJECT_KEY} AND labels = ops ORDER BY key ASC", "fields": ["status", "assignee"]}
+    r = requests.post(url, auth=(JIRA_EMAIL, JIRA_API_TOKEN), json=payload)
+    r.raise_for_status()
+    return [
+        {"key": issue["key"], "status": issue["fields"]["status"]["name"], "assigned": issue["fields"]["assignee"] is not None}
+        for issue in r.json()["issues"]
+        if issue["fields"]["status"]["name"].lower() != "done"
+    ]
+
+
+# used by alert_webhook.py to avoid creating a second ticket for an alert that's
+# still firing and already has an open ticket from an earlier firing
+# sends this to jira:
+#   POST /rest/api/3/search/jql  {"jql": "project = KAN AND labels = ops AND summary ~ \"...\" AND status != Done", "fields": ["status"]}
+# returns e.g. {"issues": [{"key": "KAN-91", "fields": {"status": {"name": "To Do"}}}]}
+def find_open_ticket_by_summary(summary_text):
+    url = f"{JIRA_URL}/rest/api/3/search/jql"
+    escaped = summary_text.replace('"', '\\"')
+    payload = {"jql": f'project = {PROJECT_KEY} AND labels = ops AND summary ~ "{escaped}" AND status != Done', "fields": ["status"]}
+    r = requests.post(url, auth=(JIRA_EMAIL, JIRA_API_TOKEN), json=payload)
+    r.raise_for_status()
+    issues = r.json()["issues"]
+    return issues[0]["key"] if issues else None
 
 
 # moves a ticket to the given status, matched by name against whatever

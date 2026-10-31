@@ -17,14 +17,18 @@ PULL_SECRET_NAME = "ghcr-pull-secret"  # ai-software-factory's GHCR package is p
 
 # walks every epic in the project (see jira_client.get_epics) instead of one
 # hardcoded epic key -- this is what makes "just create an epic in Jira" the
-# whole workflow, no more editing cronjob.yaml per epic
+# whole workflow, no more editing cronjob.yaml per epic. also walks every
+# standalone "ops" ticket (alert_webhook.py creates these from alertmanager
+# firings) -- those live outside any epic, so they get their own loop here
 def run_orchestrator():
     epics = jira_client.get_epics()
-    if not epics:
-        print("no epics found")
-        return
     for epic in epics:
         _process_epic(epic["key"], epic["assigned"])
+    ops_tickets = jira_client.get_ops_tickets()
+    for ticket in ops_tickets:
+        _process_ops_ticket(ticket["key"], ticket["status"], ticket["assigned"])
+    if not epics and not ops_tickets:
+        print("nothing to do")
 
 # looks at one epic's tasks in key order and acts on the first one that isn't
 # Done yet -- To Do spawns its k8s job, In Review checks whether its PR got
@@ -65,17 +69,35 @@ def _process_epic(epic_key, assigned):
         return  # In Progress (a job's genuinely still running) or Needs Info -- leave it
     print(f"{epic_key}: all tasks are Done")
 
+# same assignee-gate as a dev ticket's "To Do" handling, but a much simpler
+# life cycle: To Do -> spawn the sre-agent job -> In Progress -> the agent
+# itself posts a diagnosis and leaves the ticket at Needs Info (there's no
+# PR/merge step here, read-only diagnosis is the whole job). same stuck-job
+# recovery as a dev ticket too, just checking the sre-agent's own job prefix
+def _process_ops_ticket(key, status, assigned):
+    if status == "To Do":
+        if not assigned:
+            return  # waiting for a human to assign it to the sre-agent bot
+        _spawn_sre_job(key)
+        return
+    if status == "In Progress" and _job_crashed_or_missing(key, prefix="factory-sre-"):
+        jira_client.add_comment(key, "Its job crashed or disappeared while In Progress -- resetting to To Do for a retry.")
+        jira_client.transition_to(key, "To Do")
+        return
+    return  # In Progress (genuinely running) or Needs Info (diagnosis already posted) -- leave it
+
 # an "In Progress" ticket with no live job behind it is stuck -- its job either
 # crashed (backoffLimit:0 means one failure is final) or got cleaned up/never
 # spawned at all, and nothing will ever move it forward on its own. resetting
 # it to "To Do" routes it back through the normal To Do handling above, which
 # already picks the right branch (fresh vs. rework) via graph.py's own check
 # for an existing PR -- this only covers a job actually crashing or vanishing,
-# not a ticket whose job succeeded but whose own Jira status update failed
-def _job_crashed_or_missing(key):
+# not a ticket whose job succeeded but whose own Jira status update failed.
+# prefix distinguishes a dev ticket's job name from an sre-agent ticket's
+def _job_crashed_or_missing(key, prefix="factory-ticket-"):
     config.load_incluster_config()
     batch = client.BatchV1Api()
-    job_name = f"factory-ticket-{key.lower()}"
+    job_name = f"{prefix}{key.lower()}"
     try:
         job = batch.read_namespaced_job(name=job_name, namespace=NAMESPACE)
     except ApiException as e:
@@ -86,7 +108,10 @@ def _job_crashed_or_missing(key):
 
 # both ticket jobs and planning jobs share the same GPU (llama-swap pins it to
 # one process at a time, see k3s-switch's own comments on this), so only one
-# of either kind is ever allowed to run at once across every open epic
+# of either kind is ever allowed to run at once across every open epic.
+# sre-agent jobs are deliberately NOT part of this guard -- fx-verify (the
+# model sre_agent.py uses) routes through OpenRouter, not the local GPU, so
+# a diagnosis job never contends with a dev/planning job for GPU time
 def _any_active_pipeline_job():
     config.load_incluster_config()
     batch = client.BatchV1Api()
@@ -138,6 +163,26 @@ def _spawn_planning_job(epic_key):
         else:
             raise
 
+# runs sre_agent.py against one ops ticket -- no shared-GPU guard (see
+# _any_active_pipeline_job's comment), and runs under the sre-agent
+# ServiceAccount instead of the default one, since this job is the one that
+# actually needs read access to the cluster (prometheus/loki/k8s events --
+# dev/planning jobs never touch the k8s API at all, so they don't need it)
+def _spawn_sre_job(key):
+    config.load_incluster_config()
+    batch = client.BatchV1Api()
+    job_name = f"factory-sre-{key.lower()}"
+    _delete_job_if_exists(batch, job_name)
+    try:
+        manifest = _job_manifest(job_name, ["python", "sre_agent.py", key], service_account="sre-agent")
+        batch.create_namespaced_job(namespace=NAMESPACE, body=manifest)
+        print(f"spawned sre-agent job for {key}")
+    except ApiException as e:
+        if e.status == 409:
+            print(f"sre-agent job for {key} already exists, skipping")
+        else:
+            raise
+
 def _delete_job_if_exists(batch, job_name):
     try:
         batch.delete_namespaced_job(name=job_name, namespace=NAMESPACE, propagation_policy="Background")
@@ -155,16 +200,24 @@ def _delete_job_if_exists(batch, job_name):
                 return
             raise
 
-# shared by both job types -- name is the k8s job name, command is the
-# container's entrypoint (["python", "main.py", key] for a ticket job,
-# ["python", "plan_and_create_tasks.py", epic_key] for a planning job)
-def _job_manifest(name, command):
+# shared by every job type -- name is the k8s job name, command is the
+# container's entrypoint. service_account is left unset (the namespace's
+# default SA, which has no RBAC bound to it) for dev/planning jobs, since
+# those never call the k8s API -- only sre-agent jobs pass one
+def _job_manifest(name, command, service_account=None):
     container = {
         "name": "pipeline",
         "image": IMAGE,
         "command": command,
         "envFrom": [{"secretRef": {"name": SECRET_NAME}}],
     }
+    pod_spec = {
+        "containers": [container],
+        "restartPolicy": "Never",
+        "imagePullSecrets": [{"name": PULL_SECRET_NAME}],
+    }
+    if service_account:
+        pod_spec["serviceAccountName"] = service_account
     return {
         "apiVersion": "batch/v1",
         "kind": "Job",
@@ -172,15 +225,9 @@ def _job_manifest(name, command):
         "spec": {
             "backoffLimit": 0,
             "ttlSecondsAfterFinished": 3600,
-            "template": {
-                "spec": {
-                    "containers": [container],
-                    "restartPolicy": "Never",
-                    "imagePullSecrets": [{"name": PULL_SECRET_NAME}],
-                }
-            },
+            "template": {"spec": pod_spec},
         },
     }
 
-if __name__ == "__main__":  # python orchestrator.py -- walks every open epic, one step each
+if __name__ == "__main__":  # python orchestrator.py -- walks every open epic and ops ticket, one step each
     run_orchestrator()
