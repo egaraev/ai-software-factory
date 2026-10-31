@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import sys
 
@@ -32,14 +33,34 @@ MANIFESTS_WORKDIR = os.environ.get("SRE_MANIFESTS_WORKDIR", "/tmp/factory-manife
 # a formal github review
 MAX_AUTO_REWORK_ATTEMPTS = 2
 
+# caps how many rounds of tool calls fx-verify gets during investigation (see
+# _chat_with_tools) before it's forced to answer with whatever it's found --
+# stops a confused model from burning requests in an endless "let me check one
+# more thing" loop
+MAX_TOOL_ROUNDS = 6
+
 SYSTEM_PROMPT = """You are an SRE diagnosing a Kubernetes alert on a small homelab
 cluster. You're given the alert details, recent metrics, recent pod events, recent
 log lines, and (when any were found) the actual manifest files for the workload,
-pulled straight from the cluster's own GitOps repo.
+pulled straight from the cluster's own GitOps repo -- treat that as your starting
+point, not the final word.
+
+You also have read-only tools to investigate further: get_pod_status, get_pod_logs
+(set previous=true for a crashed container's last logs, often the only place the
+real crash reason shows up), get_resource_yaml (the live deployed object, which can
+differ from what's in git if something changed since the last ArgoCD sync),
+get_endpoints, and arbitrary promql_query/logql_query. None of them can change
+anything on the cluster. Use them like a real SRE would -- in particular, check
+whether the problem is actually still happening right now before you diagnose it,
+since by the time you're looking at a ticket the underlying issue may have already
+cleared. You have a limited number of tool calls, so don't repeat a query you've
+already run, and stop investigating once you have enough to answer.
 
 First write a plain-English diagnosis: what's actually wrong, the most likely root
 cause, and why -- point at the specific evidence (a log line, an event reason, a
-metric value) rather than generic explanations. Be concise, a few short paragraphs.
+metric value, something you found with a tool) rather than generic explanations. Be
+concise, a few short paragraphs. If your tools show the problem isn't actually
+happening anymore, say that plainly instead of inventing a cause to match the ticket.
 
 Then, only when you are confident the fix is a specific, small change to one of the
 manifest files you were shown, propose it -- after your diagnosis -- as one or more
@@ -99,7 +120,7 @@ async def diagnose_ticket(ticket_key):
         metrics = events = logs = "no namespace/pod on this ticket -- alert didn't carry pod-level labels"
         manifests = {}
 
-    reply = await _chat(_build_prompt(ticket, alert, metrics, events, logs, manifests, review_feedback))
+    reply = await _chat_with_tools(_build_prompt(ticket, alert, metrics, events, logs, manifests, review_feedback))
     diagnosis, fix = _parse_diagnosis_and_fix(reply)
     jira_client.add_comment(ticket_key, f"**SRE agent diagnosis (fx-verify):**\n\n{diagnosis}")
 
@@ -329,24 +350,286 @@ def _open_fix_pr(ticket_key, ticket, fix, branch, rework):
     return github_client.open_pr(branch, title, body, repo=MANIFESTS_REPO)
 
 
+# ---- live investigation tools ----------------------------------------------
+# exposed to fx-verify as tool calls during diagnosis (see _chat_with_tools).
+# all read-only, matching what's actually granted to the sre-agent
+# ServiceAccount (k8s/sre-agent/rbac.yaml in factory-manifests): pods,
+# pods/log, events, services, configmaps, endpoints, deployments/replicasets/
+# daemonsets, in the 4 namespaces this factory owns -- nothing here can
+# create, patch, or delete anything on the cluster
+
+TOOLS_SCHEMA = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_pod_status",
+            "description": "Live status of a pod right now -- phase, conditions (including Ready), and per-container state/restart count. Use this to check whether the problem the ticket describes is still actually happening before diagnosing it.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "namespace": {"type": "string"},
+                    "pod": {"type": "string", "description": "pod name or name prefix -- matches any pod whose name starts with this"},
+                },
+                "required": ["namespace", "pod"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_pod_logs",
+            "description": "Container logs read directly from the pod via the Kubernetes API, not Loki. Set previous=true to read the crashed container's logs from before its last restart -- often the only place the real crash reason shows up.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "namespace": {"type": "string"},
+                    "pod": {"type": "string"},
+                    "previous": {"type": "boolean", "description": "true reads the previous (crashed) container instance instead of the current one"},
+                    "tail": {"type": "integer", "description": "number of lines from the end, default 100"},
+                },
+                "required": ["namespace", "pod"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_resource_yaml",
+            "description": "The live, as-deployed spec of a Kubernetes object. Use this to see actual current config rather than only what's in git -- they can differ if something changed since the last ArgoCD sync, and it's the only reliable way to confirm what a ClusterRole/Role actually grants right now rather than inferring it from forbidden-watch log noise. Namespaced kinds: deployment, replicaset, daemonset, statefulset, service, configmap, serviceaccount, role, rolebinding. Cluster-scoped kinds (omit namespace): clusterrole, clusterrolebinding, node, persistentvolume, storageclass.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "kind": {"type": "string"},
+                    "name": {"type": "string"},
+                    "namespace": {"type": "string", "description": "required for namespaced kinds, omit for cluster-scoped kinds"},
+                },
+                "required": ["kind", "name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_endpoints",
+            "description": "Which pod IPs a Service currently considers ready vs not-ready. Directly useful for a PodNotReady alert -- shows whether the pod is actually missing from the Service's endpoint list right now.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "namespace": {"type": "string"},
+                    "service": {"type": "string"},
+                },
+                "required": ["namespace", "service"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "promql_query",
+            "description": "Run an arbitrary instant PromQL query against Prometheus -- for metrics beyond the restarts/cpu/memory you were already shown, e.g. a different pod, or a specific alert's current value.",
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "logql_query",
+            "description": "Run an arbitrary LogQL query against Loki -- for logs beyond the recent window you were already shown, e.g. a different pod, a longer range, or filtering for a specific string.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "limit": {"type": "integer", "description": "max lines, default 50"},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+]
+
+
+def _tool_get_pod_status(namespace, pod):
+    config.load_incluster_config()
+    v1 = client.CoreV1Api()
+    matches = [p for p in v1.list_namespaced_pod(namespace).items if p.metadata.name.startswith(pod)]
+    if not matches:
+        return f"no pod starting with '{pod}' found in namespace '{namespace}'"
+    lines = []
+    for p in matches:
+        conditions = ", ".join(f"{c.type}={c.status}" for c in (p.status.conditions or []))
+        containers = []
+        for cs in (p.status.container_statuses or []):
+            if cs.state.running:
+                state = "running"
+            elif cs.state.waiting:
+                state = f"waiting ({cs.state.waiting.reason})"
+            else:
+                state = f"terminated ({cs.state.terminated.reason})"
+            containers.append(f"{cs.name}: ready={cs.ready} restarts={cs.restart_count} {state}")
+        lines.append(f"{p.metadata.name}: phase={p.status.phase}\nconditions: {conditions}\ncontainers: {'; '.join(containers)}")
+    return "\n\n".join(lines)
+
+
+def _tool_get_pod_logs(namespace, pod, previous=False, tail=100):
+    config.load_incluster_config()
+    v1 = client.CoreV1Api()
+    matches = [p for p in v1.list_namespaced_pod(namespace).items if p.metadata.name.startswith(pod)]
+    if not matches:
+        return f"no pod starting with '{pod}' found in namespace '{namespace}'"
+    pod_name = matches[0].metadata.name
+    try:
+        return v1.read_namespaced_pod_log(pod_name, namespace, previous=previous, tail_lines=tail)
+    except client.exceptions.ApiException as e:  # e.g. no previous instance exists yet
+        return f"log read failed: {e.reason}"
+
+
+# value is (needs_namespace, reader) -- reader always takes (api, name, ns),
+# cluster-scoped ones just ignore ns. api is {"apps","core","rbac","storage"},
+# built once per call below rather than per-entry since most calls only need
+# one of the four clients
+RESOURCE_READERS = {
+    "deployment": (True, lambda api, name, ns: api["apps"].read_namespaced_deployment(name, ns)),
+    "replicaset": (True, lambda api, name, ns: api["apps"].read_namespaced_replica_set(name, ns)),
+    "daemonset": (True, lambda api, name, ns: api["apps"].read_namespaced_daemon_set(name, ns)),
+    "statefulset": (True, lambda api, name, ns: api["apps"].read_namespaced_stateful_set(name, ns)),
+    "service": (True, lambda api, name, ns: api["core"].read_namespaced_service(name, ns)),
+    "configmap": (True, lambda api, name, ns: api["core"].read_namespaced_config_map(name, ns)),
+    "serviceaccount": (True, lambda api, name, ns: api["core"].read_namespaced_service_account(name, ns)),
+    "role": (True, lambda api, name, ns: api["rbac"].read_namespaced_role(name, ns)),
+    "rolebinding": (True, lambda api, name, ns: api["rbac"].read_namespaced_role_binding(name, ns)),
+    "clusterrole": (False, lambda api, name, ns: api["rbac"].read_cluster_role(name)),
+    "clusterrolebinding": (False, lambda api, name, ns: api["rbac"].read_cluster_role_binding(name)),
+    "node": (False, lambda api, name, ns: api["core"].read_node(name)),
+    "persistentvolume": (False, lambda api, name, ns: api["core"].read_persistent_volume(name)),
+    "storageclass": (False, lambda api, name, ns: api["storage"].read_storage_class(name)),
+}
+
+
+def _tool_get_resource_yaml(kind, name, namespace=None):
+    config.load_incluster_config()
+    entry = RESOURCE_READERS.get(kind.lower())
+    if not entry:
+        return f"unsupported kind '{kind}' -- supported: {', '.join(RESOURCE_READERS)}"
+    needs_namespace, reader = entry
+    if needs_namespace and not namespace:
+        return f"'{kind}' is namespaced -- pass a namespace"
+    api = {"apps": client.AppsV1Api(), "core": client.CoreV1Api(), "rbac": client.RbacAuthorizationV1Api(), "storage": client.StorageV1Api()}
+    try:
+        obj = reader(api, name, namespace)
+    except client.exceptions.ApiException as e:
+        return f"read failed: {e.reason}"
+    return json.dumps(client.ApiClient().sanitize_for_serialization(obj), indent=2, default=str)
+
+
+def _tool_get_endpoints(namespace, service):
+    config.load_incluster_config()
+    v1 = client.CoreV1Api()
+    try:
+        ep = v1.read_namespaced_endpoints(service, namespace)
+    except client.exceptions.ApiException as e:
+        return f"read failed: {e.reason}"
+    if not ep.subsets:
+        return f"service '{service}' has no endpoint subsets -- no pods currently match+ready"
+    lines = []
+    for s in ep.subsets:
+        ready = [a.ip for a in (s.addresses or [])]
+        not_ready = [a.ip for a in (s.not_ready_addresses or [])]
+        lines.append(f"ready: {ready or 'none'}, not ready: {not_ready or 'none'}")
+    return "\n".join(lines)
+
+
+# same prometheus instant-query endpoint as _query_metrics above, but with the
+# query coming straight from the model instead of one of the 3 fixed ones
+def _tool_promql_query(query):
+    try:
+        r = requests.get(f"{PROMETHEUS_URL}/api/v1/query", params={"query": query}, timeout=10)
+        r.raise_for_status()
+        results = r.json()["data"]["result"]
+        return "\n".join(f"{res['metric']}={res['value'][1]}" for res in results) or "no data"
+    except requests.RequestException as e:
+        return f"query failed: {e}"
+
+
+def _tool_logql_query(query, limit=50):
+    try:
+        r = requests.get(
+            f"{LOKI_URL}/loki/api/v1/query_range",
+            params={"query": query, "limit": limit, "direction": "backward"},
+            timeout=10,
+        )
+        r.raise_for_status()
+        lines = []
+        for stream in r.json()["data"]["result"]:
+            lines.extend(line for _, line in stream["values"])
+        return "\n".join(lines[-limit:]) or "no results"
+    except requests.RequestException as e:
+        return f"query failed: {e}"
+
+
+TOOL_DISPATCH = {
+    "get_pod_status": _tool_get_pod_status,
+    "get_pod_logs": _tool_get_pod_logs,
+    "get_resource_yaml": _tool_get_resource_yaml,
+    "get_endpoints": _tool_get_endpoints,
+    "promql_query": _tool_promql_query,
+    "logql_query": _tool_logql_query,
+}
+
+
+# runs the tool-calling investigation loop, then returns fx-verify's final
+# diagnosis text once it stops asking for tools (or hits MAX_TOOL_ROUNDS).
+# messages grows each round: the model's own tool_calls, then one "tool" role
+# message per call carrying that call's result -- standard OpenAI-style
+# tool-calling transcript shape, which litellm passes through to fx-verify's
+# underlying model (deepseek-v4-pro-0813 via openrouter)
+async def _chat_with_tools(user_prompt):
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": user_prompt},
+    ]
+    for _ in range(MAX_TOOL_ROUNDS):
+        message = await _chat_once(messages)
+        tool_calls = message.get("tool_calls")
+        if not tool_calls:
+            return message.get("content") or ""
+        messages.append({"role": "assistant", "content": message.get("content"), "tool_calls": tool_calls})
+        for call in tool_calls:
+            name = call["function"]["name"]
+            try:
+                args = json.loads(call["function"]["arguments"] or "{}")
+                result = TOOL_DISPATCH[name](**args)
+            except Exception as e:  # bad args, unknown tool, or the tool itself raised -- tell the model, don't crash the run
+                result = f"tool call failed: {e}"
+            print(f"fx-verify tool call: {name}({call['function']['arguments']})")
+            messages.append({"role": "tool", "tool_call_id": call["id"], "content": str(result)[:4000]})
+    # used up all its investigation turns -- one more call with no tools
+    # offered, forcing a final answer from whatever it's gathered so far
+    messages.append({"role": "user", "content": "You're out of investigation turns -- give your diagnosis now based on everything you've found so far."})
+    message = await _chat_once(messages, offer_tools=False)
+    return message.get("content") or ""
+
+
 # sends this to litellm's /v1/chat/completions:
-#   {"model": "fx-verify", "messages": [{"role": "system", ...}, {"role": "user", ...}]}
-# returns e.g. {"choices": [{"message": {"content": "The pod is OOMKilling because..."}}]}
-async def _chat(user_prompt):
+#   {"model": "fx-verify", "messages": [...], "tools": [...]}
+# returns e.g. {"role": "assistant", "content": "...", "tool_calls": [{"id":
+#   "call_1", "function": {"name": "get_pod_status", "arguments":
+#   "{\"namespace\": \"observe\", \"pod\": \"kube-state-metrics\"}"}}]}
+# (tool_calls is absent once the model is done investigating and just answers)
+async def _chat_once(messages, offer_tools=True):
     url = f"{LITELLM_BASE}/v1/chat/completions"
     headers = {"Authorization": f"Bearer {LITELLM_KEY}"}
-    payload = {
-        "model": "fx-verify",
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt},
-        ],
-    }
+    payload = {"model": "fx-verify", "messages": messages}
+    if offer_tools:
+        payload["tools"] = TOOLS_SCHEMA
     timeout = aiohttp.ClientTimeout(total=120)
     async with aiohttp.ClientSession() as session:
         async with session.post(url, headers=headers, json=payload, timeout=timeout) as resp:
             data = await resp.json()
-            return data["choices"][0]["message"]["content"]
+            return data["choices"][0]["message"]
 
 
 if __name__ == "__main__":  # python sre_agent.py KAN-91 -- diagnoses one ops ticket, opens a fix PR if confident, and posts the result
