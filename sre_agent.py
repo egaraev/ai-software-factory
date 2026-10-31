@@ -66,11 +66,15 @@ for a human -- don't force a fix that isn't there."""
 # fix becomes a PR against factory-manifests -- the agent never touches the
 # live cluster itself, a human still merges before ArgoCD applies anything.
 #
-# a ticket that's already got an open (unmerged) fix PR is a rework pass, not a
-# fresh run -- either fx-review left CONCERNS and _handle_review_verdict sent it
-# back automatically, or a human did. either way the existing branch is checked
-# out (not reset from main) so the model sees its own prior attempt plus
-# whatever REWORK: feedback is on the ticket, and revises instead of starting over
+# a rework pass needs BOTH an open (unmerged) fix PR AND actual REWORK:
+# feedback on the ticket -- an open PR alone isn't enough (seen on KAN-65: a
+# human re-triggering a ticket that already had an open PR, with no feedback
+# attached, got treated as rework and shown its own old unmerged branch as if
+# it were current reality, which the model then reasoned about as if it were
+# already-deployed fact). with real feedback to act on, the existing branch is
+# checked out (not reset from main) so the model sees its own prior attempt
+# plus the feedback, and revises instead of starting over. without feedback,
+# this is just a fresh run -- reset clean from main, same as a first attempt
 async def diagnose_ticket(ticket_key):
     jira_client.transition_to(ticket_key, "In Progress")
     ticket = jira_client.get_ticket(ticket_key)
@@ -78,8 +82,9 @@ async def diagnose_ticket(ticket_key):
 
     branch = f"sre-{ticket_key.lower()}"
     existing_pr = github_client.get_pr_for_branch(branch, repo=MANIFESTS_REPO)
-    rework = existing_pr is not None and not existing_pr.get("merged_at")
-    review_feedback = jira_client.get_rework_feedback(ticket_key) if rework else None
+    has_open_pr = existing_pr is not None and not existing_pr.get("merged_at")
+    review_feedback = jira_client.get_rework_feedback(ticket_key) if has_open_pr else None
+    rework = has_open_pr and review_feedback is not None
 
     repo_ops.clone_repo(repo=MANIFESTS_REPO, workdir=MANIFESTS_WORKDIR)
     if rework:
@@ -178,7 +183,12 @@ def _build_prompt(ticket, alert, metrics, events, logs, manifests, review_feedba
     review_text = (
         f"A reviewer (fx-review, a different model from you) left this feedback on your "
         f"previous fix attempt for this same ticket. The manifests shown below already "
-        f"reflect that attempt -- revise them to address the feedback, don't start over:\n\n"
+        f"reflect that attempt -- it is YOUR OWN proposed fix, sitting on an unmerged PR. "
+        f"It is NOT yet on main, NOT yet applied to the cluster, and not evidence the "
+        f"problem is already solved -- the pod is still crash-looping right now with that "
+        f"PR unmerged, which is exactly why you're being asked again. Revise the manifests "
+        f"to address the feedback below, don't start over and don't assume the fix is "
+        f"already live just because you're looking at it:\n\n"
         f"{review_feedback}\n\n" if review_feedback else ""
     )
     return (
