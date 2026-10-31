@@ -62,6 +62,13 @@ metric value, something you found with a tool) rather than generic explanations.
 concise, a few short paragraphs. If your tools show the problem isn't actually
 happening anymore, say that plainly instead of inventing a cause to match the ticket.
 
+This diagnosis gets posted straight to Jira as your final answer, word for word -- it
+is not a scratchpad. Work through the evidence internally, then write ONLY your
+settled conclusion. Never write out your thought process -- no "let me check", "wait",
+"actually", "hmm", no reconsidering a point out loud, no narrating which file you
+think a change belongs in before deciding. If you catch yourself about to write
+"let me" or "I need to", stop and just state the answer instead.
+
 Then, only when you are confident the fix is a specific, small change to one of the
 manifest files you were shown, propose it -- after your diagnosis -- as one or more
 file blocks in exactly this format:
