@@ -15,6 +15,7 @@ NAMESPACE = "pipeline"
 IMAGE = "ghcr.io/egaraev/ai-software-factory:latest"
 SECRET_NAME = "factory-pipeline-env"
 PULL_SECRET_NAME = "ghcr-pull-secret"  # ai-software-factory's GHCR package is private
+MAX_CRASH_RETRIES = 3  # caps how many times _recover_crashed_job bounces one ticket back to To Do before giving up on it
 
 # walks every epic in the project (see jira_client.get_epics) instead of one
 # hardcoded epic key -- this is what makes "just create an epic in Jira" the
@@ -64,8 +65,7 @@ def _process_epic(epic_key, assigned):
                 continue
             return  # still waiting on the merge (manual, or auto-merge not configured)
         if status == "In Progress" and _job_crashed_or_missing(key):
-            jira_client.add_comment(key, "Its job crashed or disappeared while In Progress -- resetting to To Do for a retry.")
-            jira_client.transition_to(key, "To Do")
+            _recover_crashed_job(key, fallback_status="Needs Info")
             return
         return  # In Progress (a job's genuinely still running) or Needs Info -- leave it
     print(f"{epic_key}: all tasks are Done")
@@ -85,8 +85,7 @@ def _process_ops_ticket(key, status, assigned):
         _spawn_sre_job(key)
         return
     if status == "In Progress" and _job_crashed_or_missing(key, prefix="factory-sre-"):
-        jira_client.add_comment(key, "Its job crashed or disappeared while In Progress -- resetting to To Do for a retry.")
-        jira_client.transition_to(key, "To Do")
+        _recover_crashed_job(key, fallback_status="Human Review")
         return
     if status == "In Review":
         pr = github_client.get_pr_for_branch(f"sre-{key.lower()}", repo=sre_agent.MANIFESTS_REPO)
@@ -97,13 +96,18 @@ def _process_ops_ticket(key, status, assigned):
     return  # In Progress (genuinely running) or Needs Info (diagnosis already posted, no fix proposed) -- leave it
 
 # an "In Progress" ticket with no live job behind it is stuck -- its job either
-# crashed (backoffLimit:0 means one failure is final) or got cleaned up/never
-# spawned at all, and nothing will ever move it forward on its own. resetting
-# it to "To Do" routes it back through the normal To Do handling above, which
-# already picks the right branch (fresh vs. rework) via graph.py's own check
-# for an existing PR -- this only covers a job actually crashing or vanishing,
-# not a ticket whose job succeeded but whose own Jira status update failed.
-# prefix distinguishes a dev ticket's job name from an sre-agent ticket's
+# crashed, exhausted its retries, or got cleaned up/never spawned at all, and
+# nothing will ever move it forward on its own. _recover_crashed_job (below)
+# routes it back through the normal To Do handling above, which already picks
+# the right branch (fresh vs. rework) via graph.py's own check for an existing
+# PR -- this only covers a job actually crashing or vanishing, not a ticket
+# whose job succeeded but whose own Jira status update failed. prefix
+# distinguishes a dev ticket's job name from an sre-agent ticket's.
+# job.status.failed increments per failed POD ATTEMPT and can be nonzero mid-retry
+# (backoffLimit is now 1+, see _job_manifest), so it's not a reliable "job is
+# dead" signal on its own -- only a terminal Failed condition means every retry
+# is actually exhausted. job.status.active truthy means a pod is currently
+# running (first attempt or a retry), so that's checked first.
 def _job_crashed_or_missing(key, prefix="factory-ticket-"):
     config.load_incluster_config()
     batch = client.BatchV1Api()
@@ -114,7 +118,28 @@ def _job_crashed_or_missing(key, prefix="factory-ticket-"):
         if e.status == 404:
             return True  # never spawned, or already cleaned up -- stuck either way
         raise
-    return bool(job.status.failed)
+    if job.status.active:
+        return False  # a pod is currently running (first attempt or a retry) -- not stuck
+    conditions = job.status.conditions or []
+    return any(c.type == "Failed" and c.status == "True" for c in conditions)
+
+# bounces a stuck ticket back to To Do for another try, but only up to
+# MAX_CRASH_RETRIES -- counted via jira_client.count_crash_retries, which looks
+# for this function's own "CRASH-RETRY: [auto] ..." comments (same pattern as
+# graph.py's rework-attempt cap). without this cap a ticket whose job keeps
+# crashing (bad image, bad env var, etc.) would get bounced back to To Do and
+# respawn a fresh job every single orchestrator poll, forever -- burning
+# through retries and cluttering the ticket instead of ever surfacing to a
+# human. fallback_status lets the caller pick where a given-up-on ticket lands
+# (dev tickets go to "Needs Info", ops tickets go to "Human Review")
+def _recover_crashed_job(key, fallback_status):
+    attempts = jira_client.count_crash_retries(key)
+    if attempts < MAX_CRASH_RETRIES:
+        jira_client.add_comment(key, f"CRASH-RETRY: [auto] Its job crashed or disappeared while In Progress -- resetting to To Do for a retry ({attempts + 1}/{MAX_CRASH_RETRIES}).")
+        jira_client.transition_to(key, "To Do")
+    else:
+        jira_client.add_comment(key, f"Its job has crashed {attempts} times in a row -- stopping automatic retries, needs a human look.")
+        jira_client.transition_to(key, fallback_status)
 
 # both ticket jobs and planning jobs share the same GPU (llama-swap pins it to
 # one process at a time, see k3s-switch's own comments on this), so only one
@@ -213,8 +238,11 @@ def _delete_job_if_exists(batch, job_name):
 # shared by every job type -- name is the k8s job name, command is the
 # container's entrypoint. service_account is left unset (the namespace's
 # default SA, which has no RBAC bound to it) for dev/planning jobs, since
-# those never call the k8s API -- only sre-agent jobs pass one
-def _job_manifest(name, command, service_account=None):
+# those never call the k8s API -- only sre-agent jobs pass one.
+# backoff_limit defaults to 1 (not 0) so k8s itself retries one transient pod
+# failure (e.g. a network blip) before orchestrator.py's own crash recovery
+# ever has to kick in -- see _job_crashed_or_missing's updated comment
+def _job_manifest(name, command, service_account=None, backoff_limit=1):
     container = {
         "name": "pipeline",
         "image": IMAGE,
@@ -233,7 +261,7 @@ def _job_manifest(name, command, service_account=None):
         "kind": "Job",
         "metadata": {"name": name},
         "spec": {
-            "backoffLimit": 0,
+            "backoffLimit": backoff_limit,
             "ttlSecondsAfterFinished": 3600,
             "template": {"spec": pod_spec},
         },

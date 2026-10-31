@@ -619,17 +619,37 @@ async def _chat_with_tools(user_prompt):
 #   "call_1", "function": {"name": "get_pod_status", "arguments":
 #   "{\"namespace\": \"observe\", \"pod\": \"kube-state-metrics\"}"}}]}
 # (tool_calls is absent once the model is done investigating and just answers)
+#
+# retries a slow/flaky call rather than letting one timeout crash the whole
+# run -- by the later rounds of a tool-calling investigation this request
+# carries a lot of accumulated context, and openrouter/fx-verify occasionally
+# just takes a while. caught here, this keeps the in-progress tool-call
+# history intact (see _chat_with_tools) instead of losing it to a crashed
+# job that then has to start the whole investigation over from scratch (see
+# orchestrator.py's own crash recovery, which is the second line of defense
+# after this one)
+CHAT_RETRY_DELAYS = [5, 15, 30]  # seconds, one retry per entry
+
+
 async def _chat_once(messages, offer_tools=True):
     url = f"{LITELLM_BASE}/v1/chat/completions"
     headers = {"Authorization": f"Bearer {LITELLM_KEY}"}
     payload = {"model": "fx-verify", "messages": messages}
     if offer_tools:
         payload["tools"] = TOOLS_SCHEMA
-    timeout = aiohttp.ClientTimeout(total=120)
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, headers=headers, json=payload, timeout=timeout) as resp:
-            data = await resp.json()
-            return data["choices"][0]["message"]
+    timeout = aiohttp.ClientTimeout(total=180)
+    for attempt in range(len(CHAT_RETRY_DELAYS) + 1):
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, headers=headers, json=payload, timeout=timeout) as resp:
+                    data = await resp.json()
+                    return data["choices"][0]["message"]
+        except (asyncio.TimeoutError, aiohttp.ClientError) as e:  # openrouter/litellm being slow or flaky -- retry rather than crash the whole run
+            if attempt == len(CHAT_RETRY_DELAYS):
+                raise
+            delay = CHAT_RETRY_DELAYS[attempt]
+            print(f"fx-verify request failed ({e}), retrying in {delay}s...")
+            await asyncio.sleep(delay)
 
 
 if __name__ == "__main__":  # python sre_agent.py KAN-91 -- diagnoses one ops ticket, opens a fix PR if confident, and posts the result

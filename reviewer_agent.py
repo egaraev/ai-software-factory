@@ -29,9 +29,12 @@ cause, is it the smallest change that does so, and -- this matters most -- does 
 privilege. Don't wave through a fix that grants broader access than the root cause requires,
 especially read access to Secrets or other sensitive resources cluster-wide, when a narrower fix
 (e.g. limiting what the workload tries to collect/watch in the first place) would have worked
-just as well. Flag anything in the diff that looks unrelated to the stated problem. Be concise --
-a few sentences, not an essay. End with one line, exactly "VERDICT: APPROVE" or "VERDICT:
-CONCERNS", nothing else on that line."""
+just as well. Flag anything in the diff that looks unrelated to the stated problem. When you have
+a specific fix in mind, state the literal change -- the exact flag/arg/line, not a description of
+the category of fix -- since your feedback goes straight to another model that has to turn it
+into a real file block, not a human who can fill in the details themselves. Be concise -- a few
+sentences, not an essay. End with one line, exactly "VERDICT: APPROVE" or "VERDICT: CONCERNS",
+nothing else on that line."""
 
 
 # ticket is {"key","summary","description"}. pr_url is the opened PR's html_url.

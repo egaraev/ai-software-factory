@@ -213,6 +213,21 @@ def count_auto_rework_attempts(ticket_key):
     return sum(1 for c in r.json()["comments"] if _extract_text(c["body"]).strip().upper().startswith("REWORK: [AUTO"))
 
 
+# same idea as count_auto_rework_attempts, but for orchestrator.py's own
+# crash-retry comments ("CRASH-RETRY: [auto] ..."). caps how many times a
+# ticket gets silently bounced back to To Do after its job crashes or
+# disappears, so a persistently-broken job can't loop forever respawning a
+# fresh job every orchestrator poll
+# sends this to jira:
+#   GET /rest/api/3/issue/KAN-67/comment
+# returns e.g. {"comments": [{"body": <ADF doc containing "CRASH-RETRY: [auto] ...">}]}
+def count_crash_retries(ticket_key):
+    url = f"{JIRA_URL}/rest/api/3/issue/{ticket_key}/comment"
+    r = requests.get(url, auth=(JIRA_EMAIL, JIRA_API_TOKEN))
+    r.raise_for_status()
+    return sum(1 for c in r.json()["comments"] if _extract_text(c["body"]).strip().upper().startswith("CRASH-RETRY: [AUTO"))
+
+
 # Jira's description field is Atlassian Document Format (nested blocks of text nodes),
 # not plain text -- this walks it and joins every text node it finds.
 def _extract_text(adf):
