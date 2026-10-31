@@ -2,6 +2,8 @@ import os
 
 import aiohttp
 
+import context7_client
+
 LITELLM_BASE = os.environ.get("LITELLM_BASE", "http://litellm.ai-models.svc.cluster.local:4000")
 LITELLM_KEY = os.environ.get("LITELLM_KEY", "")
 
@@ -28,7 +30,12 @@ Repeat the block for every file you touch. Do not explain your changes outside t
 # fresh ticket (see jira_client.get_rework_feedback) -- also None otherwise.
 # returns path -> new content.
 async def generate_changes(ticket, repo_files, design_context=None, test_feedback=None, review_feedback=None):
-    user_prompt = _build_prompt(ticket, repo_files, design_context, test_feedback, review_feedback)
+    # current docs for whatever library the ticket actually mentions (FastAPI,
+    # Reflex, ...) via Context7, fetched here in code rather than letting the
+    # model decide when to look things up -- see context7_client.py. "" for
+    # the common case where the ticket doesn't touch an external library
+    library_docs = await context7_client.get_docs_for_ticket(ticket)
+    user_prompt = _build_prompt(ticket, repo_files, design_context, test_feedback, review_feedback, library_docs)
     reply = await _chat(user_prompt)
     changes = _parse_file_blocks(reply)
     if not changes:
@@ -59,10 +66,11 @@ REFORMAT_REMINDER = (
 )
 
 
-def _build_prompt(ticket, repo_files, design_context, test_feedback=None, review_feedback=None):
+def _build_prompt(ticket, repo_files, design_context, test_feedback=None, review_feedback=None, library_docs=None):
     files_text = "\n\n".join(f"--- {path} ---\n{content}" for path, content in repo_files.items())
     files_text = files_text or "(repo is empty)"
     design_text = f"Project design notes:\n\n{design_context}\n\n" if design_context else ""
+    library_text = f"Relevant library docs:\n\n{library_docs}\n\n" if library_docs else ""
     # a rework pass -- the current files already reflect the branch's prior PR,
     # and this is a human asking for a specific change on top of it (not a test
     # failure, see feedback_text below for that case)
@@ -81,7 +89,7 @@ def _build_prompt(ticket, repo_files, design_context, test_feedback=None, review
         f"{test_feedback}\n\n" if test_feedback else ""
     )
     return (
-        f"{design_text}{review_text}{feedback_text}Ticket {ticket['key']}: {ticket['summary']}\n\n{ticket['description']}\n\n"
+        f"{design_text}{library_text}{review_text}{feedback_text}Ticket {ticket['key']}: {ticket['summary']}\n\n{ticket['description']}\n\n"
         f"Current files:\n\n{files_text}"
     )
 
