@@ -24,17 +24,22 @@ def run_orchestrator():
         print("no epics found")
         return
     for epic in epics:
-        _process_epic(epic["key"])
+        _process_epic(epic["key"], epic["assigned"])
 
 # looks at one epic's tasks in key order and acts on the first one that isn't
 # Done yet -- To Do spawns its k8s job, In Review checks whether its PR got
 # merged (and closes the ticket if so, then checks the next one too), anything
 # else (In Progress/Needs Info) just waits. an epic with no tasks yet (brand
 # new, just created in Jira) gets a planning job instead, which is what turns
-# its title/description into real tasks the loop below can then walk
-def _process_epic(epic_key):
+# its title/description into real tasks the loop below can then walk.
+# assigning a ticket or epic (to anyone) is how a human opts it into
+# automation -- an unassigned "To Do" ticket, or an unassigned taskless epic,
+# just sits there untouched until someone assigns it
+def _process_epic(epic_key, assigned):
     tasks = jira_client.get_epic_tasks(epic_key)
     if not tasks:
+        if not assigned:
+            return  # new, taskless, unassigned -- waiting for a human to opt it in
         _spawn_planning_job(epic_key)
         return
     for task in tasks:
@@ -42,6 +47,8 @@ def _process_epic(epic_key):
         if status == "Done":
             continue
         if status == "To Do":
+            if not task["assigned"]:
+                return  # waiting for a human to assign it before the pipeline touches it
             _spawn_job(key)
             return
         if status == "In Review":

@@ -56,16 +56,21 @@ def append_description(ticket_key, extra_text):
 
 # lists every task under an epic, in ascending key order -- used by the phase-2
 # orchestrator to walk an epic's tickets in sequence. uses the newer JQL search
-# endpoint, since jira cloud removed the old /rest/api/3/search endpoint
+# endpoint, since jira cloud removed the old /rest/api/3/search endpoint.
+# "assigned" is True if the ticket has ANY assignee -- that's the human signal
+# the orchestrator waits for before touching a "To Do" ticket (see orchestrator.py)
 # sends this to jira:
-#   POST /rest/api/3/search/jql  {"jql": "parent = KAN-17 ORDER BY key ASC", "fields": ["status"]}
-# returns e.g. {"issues": [{"key": "KAN-18", "fields": {"status": {"name": "Done"}}}, ...]}
+#   POST /rest/api/3/search/jql  {"jql": "parent = KAN-17 ORDER BY key ASC", "fields": ["status", "assignee"]}
+# returns e.g. {"issues": [{"key": "KAN-18", "fields": {"status": {"name": "Done"}, "assignee": None}}, ...]}
 def get_epic_tasks(epic_key):
     url = f"{JIRA_URL}/rest/api/3/search/jql"
-    payload = {"jql": f"parent = {epic_key} ORDER BY key ASC", "fields": ["status"]}
+    payload = {"jql": f"parent = {epic_key} ORDER BY key ASC", "fields": ["status", "assignee"]}
     r = requests.post(url, auth=(JIRA_EMAIL, JIRA_API_TOKEN), json=payload)
     r.raise_for_status()
-    return [{"key": issue["key"], "status": issue["fields"]["status"]["name"]} for issue in r.json()["issues"]]
+    return [
+        {"key": issue["key"], "status": issue["fields"]["status"]["name"], "assigned": issue["fields"]["assignee"] is not None}
+        for issue in r.json()["issues"]
+    ]
 
 
 # lists every epic in the project that isn't Done yet, in ascending key order --
@@ -75,16 +80,22 @@ def get_epic_tasks(epic_key):
 # closed one someone never broke into Jira tasks) would otherwise look
 # "unplanned" forever and get replanned on every single poll (seen in practice:
 # a leftover "Hello World API" epic kept spawning fresh batches of tasks until
-# it got excluded here -- moving an epic to Done is now what actually stops it)
+# it got excluded here -- moving an epic to Done is now what actually stops it).
+# "assigned" is the same human-opt-in signal as get_epic_tasks -- an unassigned,
+# taskless epic just sits there instead of getting auto-planned
 # sends this to jira:
-#   POST /rest/api/3/search/jql  {"jql": "project = KAN AND issuetype = Epic ORDER BY key ASC"}
-# returns e.g. {"issues": [{"key": "KAN-24", "fields": {"status": {"name": "Done"}}}, ...]}
+#   POST /rest/api/3/search/jql  {"jql": "project = KAN AND issuetype = Epic ORDER BY key ASC", "fields": ["status", "assignee"]}
+# returns e.g. {"issues": [{"key": "KAN-24", "fields": {"status": {"name": "Done"}, "assignee": None}}, ...]}
 def get_epics():
     url = f"{JIRA_URL}/rest/api/3/search/jql"
-    payload = {"jql": f"project = {PROJECT_KEY} AND issuetype = Epic ORDER BY key ASC", "fields": ["status"]}
+    payload = {"jql": f"project = {PROJECT_KEY} AND issuetype = Epic ORDER BY key ASC", "fields": ["status", "assignee"]}
     r = requests.post(url, auth=(JIRA_EMAIL, JIRA_API_TOKEN), json=payload)
     r.raise_for_status()
-    return [{"key": issue["key"]} for issue in r.json()["issues"] if issue["fields"]["status"]["name"].lower() != "done"]
+    return [
+        {"key": issue["key"], "assigned": issue["fields"]["assignee"] is not None}
+        for issue in r.json()["issues"]
+        if issue["fields"]["status"]["name"].lower() != "done"
+    ]
 
 
 # moves a ticket to the given status, matched by name against whatever
