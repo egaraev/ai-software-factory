@@ -4,10 +4,10 @@ import sys
 
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "egaraev/factory-sample-app")
-WORKDIR = os.environ.get("FACTORY_WORKDIR", "/tmp/factory-sample-app")
 # kept separate from this factory's own venv -- tickets can add any packages
 # to the sample app over time, and those shouldn't mix with our dependencies.
 # lives next to WORKDIR, not inside it, so `git add -A` never picks it up
+WORKDIR = os.environ.get("FACTORY_WORKDIR", "/tmp/factory-sample-app")
 VENV_DIR = WORKDIR.rstrip("/") + "-venv"
 
 # dirs/extensions to skip when walking the repo for an agent's context
@@ -16,31 +16,37 @@ SKIP_EXTENSIONS = {".pyc", ".png", ".jpg", ".jpeg", ".gif", ".ico", ".db", ".sql
 MAX_FILE_BYTES = 30000
 
 
-def clone_repo():
-    if os.path.exists(WORKDIR):
-        run(["git", "fetch", "origin"], cwd=WORKDIR)
-        run(["git", "checkout", "main"], cwd=WORKDIR)
-        run(["git", "reset", "--hard", "origin/main"], cwd=WORKDIR)
-        return WORKDIR
-    url = f"https://x-access-token:{GITHUB_TOKEN}@github.com/{GITHUB_REPO}.git"
-    run(["git", "clone", url, WORKDIR])
-    return WORKDIR
+# every function below takes an optional repo/workdir override -- defaults to
+# GITHUB_REPO/WORKDIR (the sample app, used by the dev-ticket pipeline) so
+# existing call sites that don't pass one keep working unchanged, but
+# sre_agent.py passes its own MANIFESTS_REPO/MANIFESTS_WORKDIR to work against
+# factory-manifests instead
+
+def clone_repo(repo=GITHUB_REPO, workdir=WORKDIR):
+    if os.path.exists(workdir):
+        run(["git", "fetch", "origin"], cwd=workdir)
+        run(["git", "checkout", "main"], cwd=workdir)
+        run(["git", "reset", "--hard", "origin/main"], cwd=workdir)
+        return workdir
+    url = f"https://x-access-token:{GITHUB_TOKEN}@github.com/{repo}.git"
+    run(["git", "clone", url, workdir])
+    return workdir
 
 
 # -B (not -b) resets the branch to start fresh from main if a previous run already
-# created it -- WORKDIR persists between runs, so a retry would otherwise find the
+# created it -- workdir persists between runs, so a retry would otherwise find the
 # branch still sitting there from the attempt that failed partway through
-def create_branch(branch_name):
-    run(["git", "checkout", "-B", branch_name], cwd=WORKDIR)
+def create_branch(branch_name, workdir=WORKDIR):
+    run(["git", "checkout", "-B", branch_name], cwd=workdir)
 
 
 # for a rework pass (see graph.py's developer_node) -- unlike create_branch,
 # which always restarts fresh from main, this picks up the ticket's branch as
 # it was last pushed, so the model sees its own prior attempt (plus whatever
 # feedback) instead of losing it
-def checkout_branch(branch_name):
-    run(["git", "fetch", "origin", branch_name], cwd=WORKDIR)
-    run(["git", "checkout", "-B", branch_name, f"origin/{branch_name}"], cwd=WORKDIR)
+def checkout_branch(branch_name, workdir=WORKDIR):
+    run(["git", "fetch", "origin", branch_name], cwd=workdir)
+    run(["git", "checkout", "-B", branch_name, f"origin/{branch_name}"], cwd=workdir)
 
 
 # --force-with-lease since create_branch's -B means a retry's local history won't
@@ -48,18 +54,19 @@ def checkout_branch(branch_name):
 # returns False (and skips commit/push entirely) when there's nothing staged --
 # a legit outcome, not an error: it means an earlier ticket already delivered
 # whatever this one asked for, so the model regenerated identical file content.
-def commit_and_push(branch_name, message):
-    run(["git", "add", "-A"], cwd=WORKDIR)
-    nothing_staged = subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=WORKDIR).returncode == 0
+def commit_and_push(branch_name, message, workdir=WORKDIR):
+    run(["git", "add", "-A"], cwd=workdir)
+    nothing_staged = subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=workdir).returncode == 0
     if nothing_staged:
         return False
-    run(["git", "commit", "-m", message], cwd=WORKDIR)
-    run(["git", "push", "-u", "origin", branch_name, "--force-with-lease"], cwd=WORKDIR)
+    run(["git", "commit", "-m", message], cwd=workdir)
+    run(["git", "push", "-u", "origin", branch_name, "--force-with-lease"], cwd=workdir)
     return True
 
 
 # installs requirements.txt into the sample app's own venv (creating it if needed)
-# and runs its tests with that venv's pytest, not whatever's on the caller's PATH
+# and runs its tests with that venv's pytest, not whatever's on the caller's PATH.
+# sample-app-specific (pytest/venv) -- sre_agent.py's manifest fixes don't call this
 def run_tests():
     _ensure_venv()
     _install_requirements()
@@ -93,7 +100,8 @@ def run(cmd, cwd=None):
 # walks the whole repo instead of a fixed file list, since the app grows new
 # files/services (backend, frontend, compose) ticket by ticket. used both by
 # the developer agent (to edit the right files) and the architect agent (to
-# design on top of what's already there instead of in a vacuum)
+# design on top of what's already there instead of in a vacuum) -- and by
+# sre_agent.py, to see factory-manifests' current manifests before proposing a fix
 def read_repo_files(repo_dir):
     files = {}
     for root, dirs, filenames in os.walk(repo_dir):

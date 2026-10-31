@@ -9,6 +9,7 @@ from kubernetes.client.rest import ApiException
 
 import github_client
 import jira_client
+import sre_agent
 
 NAMESPACE = "pipeline"
 IMAGE = "ghcr.io/egaraev/ai-software-factory:latest"
@@ -69,11 +70,14 @@ def _process_epic(epic_key, assigned):
         return  # In Progress (a job's genuinely still running) or Needs Info -- leave it
     print(f"{epic_key}: all tasks are Done")
 
-# same assignee-gate as a dev ticket's "To Do" handling, but a much simpler
-# life cycle: To Do -> spawn the sre-agent job -> In Progress -> the agent
-# itself posts a diagnosis and leaves the ticket at Needs Info (there's no
-# PR/merge step here, read-only diagnosis is the whole job). same stuck-job
-# recovery as a dev ticket too, just checking the sre-agent's own job prefix
+# same assignee-gate as a dev ticket's "To Do" handling. life cycle: To Do ->
+# spawn the sre-agent job -> In Progress -> the agent posts a diagnosis and
+# either leaves the ticket at Needs Info (no fix it was confident enough to
+# propose) or opens a fix PR against factory-manifests and moves it to In
+# Review. In Review is then the same merge-check as a dev ticket's (see
+# _process_epic) -- a human still has to merge before ArgoCD applies anything.
+# same stuck-job recovery as a dev ticket too, just checking the sre-agent's
+# own job prefix and branch-naming convention (sre-<key>, not ticket-<key>)
 def _process_ops_ticket(key, status, assigned):
     if status == "To Do":
         if not assigned:
@@ -84,7 +88,13 @@ def _process_ops_ticket(key, status, assigned):
         jira_client.add_comment(key, "Its job crashed or disappeared while In Progress -- resetting to To Do for a retry.")
         jira_client.transition_to(key, "To Do")
         return
-    return  # In Progress (genuinely running) or Needs Info (diagnosis already posted) -- leave it
+    if status == "In Review":
+        pr = github_client.get_pr_for_branch(f"sre-{key.lower()}", repo=sre_agent.MANIFESTS_REPO)
+        if pr and pr.get("merged_at"):
+            jira_client.add_comment(key, "Fix PR merged -- closing ticket.")
+            jira_client.transition_to(key, "Done")
+        return  # still waiting on the merge (manual, or auto-merge not configured)
+    return  # In Progress (genuinely running) or Needs Info (diagnosis already posted, no fix proposed) -- leave it
 
 # an "In Progress" ticket with no live job behind it is stuck -- its job either
 # crashed (backoffLimit:0 means one failure is final) or got cleaned up/never
