@@ -19,6 +19,12 @@ async def _embed(query_text):
     async with aiohttp.ClientSession() as session:
         async with session.post(url, headers=headers, json=payload) as resp:
             if resp.status != 200:
+                # the generic "embedding request failed" message in search() below
+                # doesn't say why -- print the real status + body here so the next
+                # failure is diagnosable straight from the job log, not another
+                # round of guessing/reproducing
+                body = await resp.text()
+                print(f"knowledge base: embedding request got HTTP {resp.status} -- {body[:300]}")
                 return None
             data = await resp.json()
             return data["data"][0]["embedding"]
