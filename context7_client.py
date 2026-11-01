@@ -59,7 +59,9 @@ async def get_docs_for_ticket(ticket):
     text = f"{ticket['summary']} {ticket['description']}".lower()
     matched = [name for name in KNOWN_LIBRARIES if name in text]
     if not matched:
+        print("context7: ticket doesn't mention a known library, skipping")
         return ""
+    print(f"context7: ticket mentions {', '.join(matched)} -- looking up docs")
     sections = []
     for name in matched:
         try:
@@ -67,10 +69,14 @@ async def get_docs_for_ticket(ticket):
                 KNOWN_LIBRARIES[name] = await resolve_library_id(name)
             library_id = KNOWN_LIBRARIES[name]
             if not library_id:
+                print(f"context7: couldn't resolve a library id for {name}, skipping")
                 continue
             docs = await get_library_docs(library_id, ticket["summary"])
             if docs:
+                print(f"context7: got {len(docs)} chars of docs for {name} ({library_id})")
                 sections.append(f"--- {name} docs (Context7) ---\n{docs}")
+            else:
+                print(f"context7: resolved {name} to {library_id} but got no docs back for this query")
         except aiohttp.ClientError as e:  # Context7 being down/slow shouldn't block a ticket -- just skip it
             print(f"warning: Context7 lookup for {name} failed ({e}), skipping")
     return "\n\n".join(sections)
