@@ -127,6 +127,27 @@ def get_ops_tickets():
     ]
 
 
+# every "ops" ticket ever, Done ones included -- unlike get_ops_tickets() above,
+# this is for dora_metrics.py's change-failure-rate/mttr math, which needs
+# exactly the closed ones (and their resolution time), not just the open backlog
+# sends this to jira:
+#   POST /rest/api/3/search/jql  {"jql": "project = KAN AND labels = ops ORDER BY key ASC",
+#     "fields": ["created", "resolutiondate", "status"]}
+# returns e.g. {"issues": [{"key": "KAN-91", "fields": {"status": {"name": "Done"},
+#   "created": "2026-10-30T09:00:00.000+0000", "resolutiondate": "2026-10-30T10:30:00.000+0000"}}]}
+def get_ops_ticket_history():
+    url = f"{JIRA_URL}/rest/api/3/search/jql"
+    payload = {"jql": f"project = {PROJECT_KEY} AND labels = ops ORDER BY key ASC",
+               "fields": ["status", "created", "resolutiondate"]}
+    r = requests.post(url, auth=(JIRA_EMAIL, JIRA_API_TOKEN), json=payload)
+    r.raise_for_status()
+    return [
+        {"key": issue["key"], "status": issue["fields"]["status"]["name"],
+         "created": issue["fields"]["created"], "resolved": issue["fields"]["resolutiondate"]}
+        for issue in r.json()["issues"]
+    ]
+
+
 # used by alert_webhook.py to avoid creating a second ticket for an alert that's
 # still firing and already has an open ticket from an earlier firing
 # sends this to jira:
