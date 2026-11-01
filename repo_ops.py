@@ -1,4 +1,6 @@
+import json
 import os
+import shutil
 import subprocess
 import sys
 
@@ -75,6 +77,92 @@ def run_tests():
         return False, "pytest not installed -- requirements.txt is missing it, or there's nothing to test yet"
     result = subprocess.run([pytest_bin], cwd=WORKDIR, capture_output=True, text=True)
     return result.returncode == 0, result.stdout + result.stderr
+
+
+# scoped to specific test file(s) instead of the whole suite -- used by
+# write_tests_node to confirm a freshly-written spec test actually fails
+# before any implementation exists (if it already passes, it's probably
+# vacuous -- see test_writer_agent.py's own SYSTEM_PROMPT about that).
+# sample-app-specific (pytest/venv) same as run_tests() above, no workdir
+# param for the same reason that one doesn't have one -- this pipeline only
+# ever runs against WORKDIR, sre_agent.py's manifest fixes don't call this
+def run_scoped_tests(test_paths):
+    _ensure_venv()
+    _install_requirements()
+    pytest_bin = os.path.join(VENV_DIR, "bin", "pytest")
+    if not os.path.exists(pytest_bin) or not test_paths:
+        return False, "pytest not installed, or no test paths given"
+    result = subprocess.run([pytest_bin, *test_paths], cwd=WORKDIR, capture_output=True, text=True)
+    return result.returncode == 0, result.stdout + result.stderr
+
+
+# runs mutmut (pip-installed into this repo's own venv, same pattern as
+# scorecard.py installing ruff/radon/pip-audit there) against source_paths,
+# using only test_paths -- the ticket's own locked spec tests -- as the
+# kill-check, not the app's whole existing test suite. that scoping is the
+# whole point: this measures whether THESE new tests actually catch bugs in
+# THIS ticket's new code, not how well-tested the app is overall.
+# mutmut 3.x reads its scope from a [tool.mutmut] section in pyproject.toml,
+# not CLI flags -- temporarily appended here and restored afterwards so a
+# sample app that already has its own pyproject.toml isn't left with factory
+# tooling config in it. returns the mutmut-cicd-stats.json dict (killed/
+# survived/total/no_tests/...) plus a "surviving" list of the first few
+# non-killed mutant names, or None if mutmut couldn't connect the tests to
+# the mutated code at all (seen on a flat, non-package file layout -- not
+# every repo's import structure plays nicely with mutmut's sandboxing, and
+# this is advisory only, so an inconclusive run is reported as just that,
+# not treated as a failure)
+def run_mutation_tests(workdir, source_paths, test_paths):
+    source_paths = [p for p in source_paths if p.endswith(".py")]
+    if not source_paths or not test_paths:
+        return None
+    _ensure_venv()
+    pip_bin = os.path.join(VENV_DIR, "bin", "pip")
+    # pinned -- mutmut's own config keys changed between recent versions
+    # (paths_to_mutate/tests_dir -> source_paths/pytest_add_cli_args_test_selection),
+    # confirmed live against 3.8.1 before this shipped. an unpinned install
+    # picking up a newer release later could silently break the config below
+    run([pip_bin, "install", "mutmut==3.8.1"])
+
+    mutants_dir = os.path.join(workdir, "mutants")
+    if os.path.exists(mutants_dir):
+        shutil.rmtree(mutants_dir)  # workdir is reused across tickets -- clear out a previous ticket's cached run
+
+    pyproject_path = os.path.join(workdir, "pyproject.toml")
+    original = open(pyproject_path).read() if os.path.exists(pyproject_path) else None
+    with open(pyproject_path, "a" if original else "w") as f:
+        f.write(("\n" if original else "") + _mutmut_toml_section(source_paths, test_paths))
+
+    mutmut_bin = os.path.join(VENV_DIR, "bin", "mutmut")
+    try:
+        # not check=True -- mutmut exits non-zero even on a clean run (e.g.
+        # real survivors, or an inconclusive coverage match), that's expected
+        # and not itself an error; the stats file is the real signal
+        subprocess.run([mutmut_bin, "run"], cwd=workdir, capture_output=True, text=True, timeout=600)
+        subprocess.run([mutmut_bin, "export-cicd-stats"], cwd=workdir, capture_output=True, text=True)
+        stats_path = os.path.join(mutants_dir, "mutmut-cicd-stats.json")
+        if not os.path.exists(stats_path):
+            return None
+        with open(stats_path) as f:
+            stats = json.load(f)
+        results = subprocess.run([mutmut_bin, "results"], cwd=workdir, capture_output=True, text=True)
+        # "mutmut results" (no --all) already lists only the non-killed ones --
+        # capped here so a weak test suite with dozens of survivors doesn't
+        # blow up the PR body / reviewer_agent prompt
+        stats["surviving"] = results.stdout.strip().splitlines()[:10]
+        return stats
+    finally:
+        if original is not None:
+            with open(pyproject_path, "w") as f:
+                f.write(original)
+        else:
+            os.remove(pyproject_path)
+
+
+def _mutmut_toml_section(source_paths, test_paths):
+    source_list = ", ".join(f'"{p}"' for p in source_paths)
+    test_list = ", ".join(f'"{p}"' for p in test_paths)
+    return f"[tool.mutmut]\nsource_paths = [{source_list}]\npytest_add_cli_args_test_selection = [{test_list}]\n"
 
 
 def _ensure_venv():

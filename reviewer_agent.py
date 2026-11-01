@@ -3,6 +3,7 @@ import os
 import aiohttp
 
 import github_client
+import knowledge_client
 
 LITELLM_BASE = os.environ.get("LITELLM_BASE", "http://litellm.ai-models.svc.cluster.local:4000")
 LITELLM_KEY = os.environ.get("LITELLM_KEY", "")
@@ -10,9 +11,12 @@ LITELLM_KEY = os.environ.get("LITELLM_KEY", "")
 SYSTEM_PROMPT = """You are reviewing a pull request before a human decides whether to merge it.
 Check the diff against the ticket's requirements: does it do what was asked, are there obvious
 bugs, missing tests, or anything that looks unsafe. You're also given the local test run's
-result -- failing tests always mean CONCERNS, never APPROVE. Be concise -- a few sentences, not
-an essay. End with one line, exactly "VERDICT: APPROVE" or "VERDICT: CONCERNS", nothing else on
-that line."""
+result -- failing tests always mean CONCERNS, never APPROVE. If a mutation-testing summary is
+included, it's telling you whether the ticket's own spec tests actually catch bugs in the new
+code, not just that they pass -- weigh a lot of surviving mutants as a sign the tests are too
+weak to trust, but this is advisory context for your judgment, not a separate hard gate on its
+own. Be concise -- a few sentences, not an essay. End with one line, exactly "VERDICT: APPROVE"
+or "VERDICT: CONCERNS", nothing else on that line."""
 
 # used for the sre-agent's fix PRs instead of SYSTEM_PROMPT above -- there's no test
 # run to weigh here (these are manifest fixes, not code with a pytest suite), but
@@ -47,12 +51,19 @@ nothing else on that line."""
 # collaborator account's token is configured, posts a real github review (Approve/
 # Request changes) under that account, which is what can actually satisfy a branch
 # protection rule -- otherwise falls back to a plain comment under the main
-# account. returns (approved, reply) -- graph.py uses approved to decide
-# whether to auto-merge or auto-rework the PR
-async def review_pr(ticket, pr_url, tests_passed, test_output):
+# account. mutation_summary is graph.py's _mutation_summary_text output, or None
+# when mutation testing was skipped/inconclusive for this ticket -- advisory
+# context only, see SYSTEM_PROMPT. returns (approved, reply) -- graph.py uses
+# approved to decide whether to auto-merge or auto-rework the PR
+async def review_pr(ticket, pr_url, tests_passed, test_output, mutation_summary=None):
     pr_number = github_client.pr_number_from_url(pr_url)
     diff = github_client.get_pr_diff(pr_number)
-    reply = await _chat(SYSTEM_PROMPT, _build_prompt(ticket, diff, tests_passed, test_output))
+    # internal standards relevant to this diff (code review standard, python
+    # standards, testing standard, etc.), fetched here in code the same way
+    # developer_agent.py/architect_agent.py do it. production_only standards
+    # are filtered out -- most PRs here are day-to-day homelab app code
+    standards_text = await knowledge_client.search(f"{ticket['summary']}\n\n{diff}", exclude_production_only=True)
+    reply = await _chat(SYSTEM_PROMPT, _build_prompt(ticket, diff, tests_passed, test_output, standards_text, mutation_summary))
     # failing tests always block approval no matter what the model's verdict line
     # says -- a deterministic floor under the model's judgment. fx-verify doesn't
     # reliably follow the "failing tests = CONCERNS" system prompt instruction on
@@ -71,10 +82,12 @@ async def review_pr(ticket, pr_url, tests_passed, test_output):
     return approved, reply
 
 
-def _build_prompt(ticket, diff, tests_passed, test_output):
+def _build_prompt(ticket, diff, tests_passed, test_output, standards_text=None, mutation_summary=None):
     status = "passed" if tests_passed else "FAILED"
     tests_text = f"Local test run: {status}\n```\n{test_output}\n```\n\n"
-    return f"Ticket {ticket['key']}: {ticket['summary']}\n\n{ticket['description']}\n\n{tests_text}Diff:\n\n{diff}"
+    mutation_text = f"{mutation_summary}\n\n" if mutation_summary else ""
+    standards_section = f"Relevant internal engineering standards:\n\n{standards_text}\n\n" if standards_text else ""
+    return f"{standards_section}Ticket {ticket['key']}: {ticket['summary']}\n\n{ticket['description']}\n\n{tests_text}{mutation_text}Diff:\n\n{diff}"
 
 
 # used for the sre-agent's fix PRs -- ticket_key/summary/diagnosis describe the ops
@@ -88,14 +101,25 @@ def _build_prompt(ticket, diff, tests_passed, test_output):
 async def review_fix_pr(ticket_key, summary, diagnosis, pr_url, repo):
     pr_number = github_client.pr_number_from_url(pr_url)
     diff = github_client.get_pr_diff(pr_number, repo=repo)
-    reply = await _chat(FIX_REVIEW_SYSTEM_PROMPT, _build_fix_review_prompt(ticket_key, summary, diagnosis, diff), model="fx-review")
+    # internal standards relevant to this fix -- RBAC/secrets policy, k8s
+    # troubleshooting runbook, etc. NOT filtered for production_only: an RBAC
+    # least-privilege check is exactly the kind of thing worth seeing in full
+    # even on a homelab, since this reviewer's whole job here is catching an
+    # overly-broad grant
+    standards_text = await knowledge_client.search(f"{summary}\n\n{diagnosis}\n\n{diff}")
+    reply = await _chat(
+        FIX_REVIEW_SYSTEM_PROMPT,
+        _build_fix_review_prompt(ticket_key, summary, diagnosis, diff, standards_text),
+        model="fx-review",
+    )
     approved = "VERDICT: APPROVE" in reply
     github_client.post_pr_comment(pr_number, f"**AI review (fx-review):**\n\n{reply}", repo=repo)
     return approved, reply
 
 
-def _build_fix_review_prompt(ticket_key, summary, diagnosis, diff):
-    return f"Ticket {ticket_key}: {summary}\n\nThe sre-agent's own diagnosis:\n{diagnosis}\n\nDiff:\n\n{diff}"
+def _build_fix_review_prompt(ticket_key, summary, diagnosis, diff, standards_text=None):
+    standards_section = f"Relevant internal engineering standards:\n\n{standards_text}\n\n" if standards_text else ""
+    return f"{standards_section}Ticket {ticket_key}: {summary}\n\nThe sre-agent's own diagnosis:\n{diagnosis}\n\nDiff:\n\n{diff}"
 
 
 # sends this to litellm's /v1/chat/completions:
