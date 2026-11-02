@@ -131,6 +131,17 @@ dora_metrics.py         DORA metrics from git deploy history + Jira ops tickets
 graph.py                dev-pipeline state machine
 ```
 
+## Build & deploy
+
+```mermaid
+flowchart LR
+    A["push to main"] --> B["build-and-push<br/>checkout, build image, push :latest"]
+    B --> C[("ghcr.io/egaraev/<br/>ai-software-factory:latest")]
+    C --> D["every CronJob in ns: pipeline<br/>pulls :latest on its next scheduled run"]
+```
+
+Every push to `main` rebuilds and republishes the image every pipeline CronJob runs — there is no test job gating it and no staging environment for this code, unlike `factory-sample-app`'s multi-stage pipeline (see that repo's README). A broken push here reaches every scheduled job — `factory-orchestrator`, `promote-staging`, `dora-metrics`, `repo-scorecard` — on their next tick, with nothing in between to catch it.
+
 ## Setup
 
 ```bash
